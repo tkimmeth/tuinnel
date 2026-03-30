@@ -3,32 +3,28 @@
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //
 // Layout:
-//   ┌─ pvpn ────────────────────────────────────────────────────────┐
-//   │  [Globe]          │  [Connection Info]                        │
-//   │  Spinning braille │  Server, City, IP, Protocol, Uptime, KS  │
-//   │  globe with       ├──────────────────────────────────────────│
-//   │  server marker    │  [Bandwidth]                              │
-//   │                   │  RX/TX sparklines                         │
-//   ├───────────────────┼──────────────────────────────────────────│
-//   │  [Actions]        │  [Network]                                │
-//   │  > Reconnect      │  SSID, Route, DNS, Leak                  │
-//   │    Change Server  │                                           │
-//   │    Disconnect     │                                           │
-//   └─ j/k  Enter  r  q ─────────────────────── pvpn v0.1.0 ─────┘
-//
-// All blocking operations (connect, disconnect, security audit, etc.) run
-// in background threads. The UI stays responsive with a spinner overlay
-// while work is in progress. Results arrive via mpsc channels.
+//   ┌─ tuinnel ────────────────────────────────────────────────────────┐
+//   │  [Globe]          │  [Connection Info]                           │
+//   │  Spinning braille │  Server, City, IP, Protocol, Uptime, KS     │
+//   │  globe with       ├─────────────────────────────────────────────│
+//   │  server marker    │  [Bandwidth]                                 │
+//   │                   │  RX/TX sparklines                            │
+//   ├───────────────────┼─────────────────────────────────────────────│
+//   │  [Actions]        │  [Network]                                   │
+//   │  > Reconnect      │  SSID, Route, DNS, Leak                     │
+//   │    Change Server  │                                              │
+//   │    Disconnect     │                                              │
+//   └─ j/k  Enter  r  q ──────────────────── tuinnel v0.2.0 ─────────┘
 
+use crate::backend::{ConnectTarget, SessionInfo, VpnBackend, VpnManager};
 use crate::bandwidth::BandwidthMonitor;
-use crate::commands;
 use crate::config::Config;
 use crate::geo;
 use crate::globe::{self, WorldMap};
 use crate::net;
 use crate::output::OutputBuffer;
 use crate::security;
-use crate::vpn::{ConnectMode, ProtonVPN};
+use crate::servers::{self, ServerEntry};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{
@@ -83,17 +79,15 @@ enum AppMessage {
         title: String,
         buf: OutputBuffer,
     },
+    ConnectResult {
+        result: Result<SessionInfo, String>,
+    },
+    DisconnectResult {
+        result: Result<(), String>,
+    },
     StatsRefreshed {
-        conn_info: ConnectionInfo,
+        ip: String,
         net_info: NetworkInfo,
-    },
-    CountriesFetched {
-        entries: Vec<PickerEntry>,
-    },
-    CitiesFetched {
-        country_code: String,
-        country_name: String,
-        entries: Vec<PickerEntry>,
     },
 }
 
@@ -113,7 +107,7 @@ enum PickerStep {
 struct PickerState {
     step: PickerStep,
     all_entries: Vec<PickerEntry>,
-    filtered: Vec<usize>, // indices into all_entries
+    filtered: Vec<usize>,
     query: String,
     selected: usize,
     scroll_offset: usize,
@@ -151,7 +145,6 @@ impl PickerState {
     }
 }
 
-/// Simple fuzzy match: all chars of needle appear in haystack in order.
 fn fuzzy_match(haystack: &str, needle: &str) -> bool {
     let mut hay = haystack.chars().peekable();
     for nc in needle.chars() {
@@ -200,7 +193,7 @@ struct NetworkInfo {
     ssid: String,
     route: String,
     dns: String,
-    dns_is_proton: bool,
+    dns_safe: bool,
     leak: String,
 }
 
@@ -229,39 +222,48 @@ struct App {
     // Overlay state machine
     overlay: OverlayState,
 
-    // Shared state for background threads
-    vpn: Arc<ProtonVPN>,
+    // Shared state
+    backend: Arc<dyn VpnBackend>,
+    servers: Vec<ServerEntry>,
+    session: Option<SessionInfo>,
     config: Arc<Config>,
     msg_tx: mpsc::Sender<AppMessage>,
     msg_rx: mpsc::Receiver<AppMessage>,
     stats_refresh_pending: bool,
-
-    // Server picker cache
-    cached_countries: Option<Vec<PickerEntry>>,
 }
 
 impl App {
-    fn new(vpn: Arc<ProtonVPN>, config: Arc<Config>) -> Self {
+    fn new(
+        backend: Arc<dyn VpnBackend>,
+        servers: Vec<ServerEntry>,
+        session: Option<SessionInfo>,
+        config: Arc<Config>,
+    ) -> Self {
         let mut list_state = ListState::default();
         list_state.select(Some(0));
 
         let world_map = WorldMap::generate();
-        let conn_info = Self::gather_connection_info(&vpn);
-        let net_info = Self::gather_network_info();
-        let bandwidth = BandwidthMonitor::new();
+        let conn_info = Self::connection_info_from_session(&session);
 
-        let server_coords = conn_info
-            .server
-            .as_str()
-            .ne("--")
-            .then(|| geo::lookup_server(&conn_info.server))
-            .flatten();
+        let mut bandwidth = BandwidthMonitor::new();
+        if let Some(ref s) = session {
+            bandwidth.set_interface(Some(s.interface.clone()));
+        }
 
-        let connect_time = if conn_info.connected {
+        let server_coords = session.as_ref().and_then(|s| {
+            match (s.lat, s.lon) {
+                (Some(lat), Some(lon)) => Some((lat, lon)),
+                _ => geo::lookup_city_name(&s.city),
+            }
+        });
+
+        let connect_time = if session.is_some() {
             Some(Instant::now())
         } else {
             None
         };
+
+        let net_info = Self::gather_network_info(session.as_ref());
 
         let (msg_tx, msg_rx) = mpsc::channel();
 
@@ -278,12 +280,13 @@ impl App {
             last_stats_refresh: Instant::now(),
             last_bw_sample: Instant::now(),
             overlay: OverlayState::None,
-            vpn,
+            backend,
+            servers,
+            session,
             config,
             msg_tx,
             msg_rx,
             stats_refresh_pending: false,
-            cached_countries: None,
         }
     }
 
@@ -309,104 +312,44 @@ impl App {
         self.list_state.select(Some(i));
     }
 
-    fn gather_connection_info(vpn: &ProtonVPN) -> ConnectionInfo {
-        let status_text = vpn.status().unwrap_or_default();
-        let lower = status_text.to_lowercase();
-        let connected = lower.contains("connected") && !lower.contains("disconnected");
+    fn connection_info_from_session(session: &Option<SessionInfo>) -> ConnectionInfo {
+        match session {
+            Some(s) => {
+                let server = s.display_name.clone();
+                let city = if s.city.is_empty() { "--".into() } else { s.city.clone() };
+                let protocol = s.protocol.to_string();
+                let kill_switch = if security::check_kill_switch_firewall().passed {
+                    "ON (firewall rules active)".into()
+                } else {
+                    "OFF".into()
+                };
 
-        let mut server = "--".to_string();
-        let mut city = "--".to_string();
-        let protocol;
-
-        if connected {
-            for line in status_text.lines() {
-                let trimmed = line.trim();
-                if trimmed.contains("Name:") {
-                    if let Some(name) = trimmed.split("Name:").nth(1) {
-                        // Clean up: remove "Device: ..." suffix from nmcli output
-                        let name = name.split("Device:").next().unwrap_or(name).trim();
-                        if name.to_lowercase().contains("proton")
-                            || name.contains('-')
-                            || name.contains('#')
-                        {
-                            // Extract server ID (e.g. "US-CA#295" from "ProtonVPN US-CA#295")
-                            let server_id = name
-                                .split_whitespace()
-                                .find(|w| w.contains('#'))
-                                .unwrap_or(name);
-                            server = server_id.to_string();
-                            if let Some(city_name) = geo::server_city_name(server_id) {
-                                city = city_name.to_string();
-                            }
-                        }
-                    }
+                ConnectionInfo {
+                    connected: true,
+                    server,
+                    city,
+                    ip: "--".into(), // filled by stats refresh
+                    protocol,
+                    kill_switch,
                 }
             }
-
-            let (tunneled, route) = net::is_tunneled();
-            if route.contains("wg") || route.contains("proton0") {
-                protocol = "WireGuard".to_string();
-            } else if route.contains("tun") {
-                protocol = "OpenVPN".to_string();
-            } else if tunneled {
-                protocol = "VPN tunnel".to_string();
-            } else {
-                protocol = "--".to_string();
-            }
-        } else {
-            protocol = "--".to_string();
-        }
-
-        let ip = if connected {
-            net::public_ip()
-        } else {
-            "--".to_string()
-        };
-
-        // Kill switch — enhanced with firewall verification
-        let kill_switch = if vpn.caps.kill_switch {
-            match vpn.kill_switch("status") {
-                Ok(s) => {
-                    let is_on =
-                        s.to_lowercase().contains("on") || s.to_lowercase().contains("active");
-                    if is_on {
-                        let fw_check = security::check_kill_switch_firewall();
-                        if fw_check.passed {
-                            format!("ON ({})", fw_check.detail)
-                        } else {
-                            "PARTIAL - no FW rules".to_string()
-                        }
-                    } else {
-                        "OFF".to_string()
-                    }
-                }
-                Err(_) => "unknown".to_string(),
-            }
-        } else {
-            "N/A".to_string()
-        };
-
-        ConnectionInfo {
-            connected,
-            server,
-            city,
-            ip,
-            protocol,
-            kill_switch,
+            None => ConnectionInfo {
+                connected: false,
+                server: "--".into(),
+                city: "--".into(),
+                ip: "--".into(),
+                protocol: "--".into(),
+                kill_switch: "OFF".into(),
+            },
         }
     }
 
-    fn gather_network_info() -> NetworkInfo {
+    fn gather_network_info(session: Option<&SessionInfo>) -> NetworkInfo {
         let ssid = net::wifi_ssid();
 
         let route_raw = net::default_route();
-        let route = route_raw
-            .lines()
-            .next()
-            .unwrap_or("--")
-            .to_string();
+        let route = route_raw.lines().next().unwrap_or("--").to_string();
 
-        // DNS with ProtonDNS detection
         let dns_raw = net::dns_servers();
         let dns_line = dns_raw
             .lines()
@@ -416,32 +359,29 @@ impl App {
             .unwrap_or_else(|| dns_raw.lines().next().unwrap_or("--"))
             .to_string();
 
-        let dns_check = security::check_dns_leak();
-        let dns_is_proton = dns_check.passed;
+        let expected_dns = session
+            .map(|s| s.dns_servers.as_slice())
+            .unwrap_or(&[]);
+        let dns_check = security::check_dns_leak(expected_dns);
+        let dns_safe = dns_check.passed;
 
-        let dns = if dns_is_proton {
-            format!("{dns_line} (ProtonDNS)")
+        let dns = if dns_safe && !expected_dns.is_empty() {
+            format!("{dns_line} (VPN DNS)")
         } else {
             dns_line
         };
 
-        // Comprehensive leak check
-        let (tunneled, _) = net::is_tunneled();
-        let ipv6_check = security::check_ipv6_leak();
+        let iface = session.map(|s| s.interface.as_str());
+        let (tunneled, _) = net::is_tunneled(iface);
+        let ipv6_check = security::check_ipv6_leak(session);
 
-        let leak = if tunneled && dns_is_proton && ipv6_check.passed {
+        let leak = if tunneled && dns_safe && ipv6_check.passed {
             "None detected".to_string()
         } else {
             let mut issues = Vec::new();
-            if !tunneled {
-                issues.push("traffic not tunneled");
-            }
-            if !dns_is_proton {
-                issues.push("DNS leak");
-            }
-            if !ipv6_check.passed {
-                issues.push("IPv6 leak");
-            }
+            if !tunneled { issues.push("traffic not tunneled"); }
+            if !dns_safe { issues.push("DNS leak"); }
+            if !ipv6_check.passed { issues.push("IPv6 leak"); }
             if issues.is_empty() {
                 "None detected".to_string()
             } else {
@@ -449,41 +389,38 @@ impl App {
             }
         };
 
-        NetworkInfo {
-            ssid,
-            route,
-            dns,
-            dns_is_proton,
-            leak,
-        }
+        NetworkInfo { ssid, route, dns, dns_safe, leak }
     }
 
-    /// Spawn a background thread to refresh VPN/network stats.
     fn spawn_stats_refresh(&mut self) {
         if self.stats_refresh_pending {
             return;
         }
         self.stats_refresh_pending = true;
-        let vpn = Arc::clone(&self.vpn);
+        let session = self.session.clone();
         let tx = self.msg_tx.clone();
         thread::spawn(move || {
-            let conn_info = App::gather_connection_info(&vpn);
-            let net_info = App::gather_network_info();
-            let _ = tx.send(AppMessage::StatsRefreshed { conn_info, net_info });
+            let ip = net::public_ip();
+            let net_info = App::gather_network_info(session.as_ref());
+            let _ = tx.send(AppMessage::StatsRefreshed { ip, net_info });
         });
     }
 
-    /// Apply stats received from a background refresh.
-    fn apply_stats_refresh(&mut self, conn_info: ConnectionInfo, net_info: NetworkInfo) {
-        self.conn_info = conn_info;
+    fn apply_stats_refresh(&mut self, ip: String, net_info: NetworkInfo) {
+        self.conn_info = Self::connection_info_from_session(&self.session);
+        self.conn_info.ip = ip;
         self.net_info = net_info;
-        self.bandwidth.refresh_interface();
 
-        self.server_coords = if self.conn_info.server != "--" {
-            geo::lookup_server(&self.conn_info.server)
+        if let Some(ref s) = self.session {
+            self.bandwidth.set_interface(Some(s.interface.clone()));
+            self.server_coords = match (s.lat, s.lon) {
+                (Some(lat), Some(lon)) => Some((lat, lon)),
+                _ => geo::lookup_city_name(&s.city),
+            };
         } else {
-            None
-        };
+            self.bandwidth.set_interface(None);
+            self.server_coords = None;
+        }
 
         if self.conn_info.connected && self.connect_time.is_none() {
             self.connect_time = Some(Instant::now());
@@ -514,7 +451,7 @@ impl App {
 
 // ── Entry Point ─────────────────────────────────────────────────────────────
 
-pub fn run(config: Arc<Config>, vpn: Arc<ProtonVPN>) -> anyhow::Result<()> {
+pub fn run(config: Arc<Config>, manager: &mut VpnManager) -> anyhow::Result<()> {
     if !io::stdout().is_terminal() {
         anyhow::bail!("TUI requires a terminal (TTY)");
     }
@@ -522,12 +459,20 @@ pub fn run(config: Arc<Config>, vpn: Arc<ProtonVPN>) -> anyhow::Result<()> {
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
 
-    let backend = CrosstermBackend::new(stdout());
-    let mut terminal = Terminal::new(backend)?;
+    let ratatui_backend = CrosstermBackend::new(stdout());
+    let mut terminal = Terminal::new(ratatui_backend)?;
 
-    let mut app = App::new(vpn, config);
+    let mut app = App::new(
+        Arc::clone(&manager.backend),
+        manager.servers.clone(),
+        manager.session.clone(),
+        config,
+    );
 
     let result = main_loop(&mut terminal, &mut app);
+
+    // Sync session back to manager
+    manager.session = app.session;
 
     disable_raw_mode()?;
     stdout().execute(LeaveAlternateScreen)?;
@@ -569,52 +514,63 @@ fn main_loop(
                             scroll: 0,
                         });
                     }
-                    // Refresh stats after any action completes
                     app.spawn_stats_refresh();
                 }
-                AppMessage::StatsRefreshed { conn_info, net_info } => {
-                    app.apply_stats_refresh(conn_info, net_info);
+                AppMessage::ConnectResult { result } => {
+                    match result {
+                        Ok(session) => {
+                            let mut buf = OutputBuffer::new();
+                            buf.ok("Connected!");
+                            buf.kv("Server", &session.display_name);
+                            buf.kv("Interface", &session.interface);
+                            buf.kv("Protocol", &session.protocol.to_string());
+                            app.session = Some(session);
+                            app.connect_time = Some(Instant::now());
+                            if matches!(app.overlay, OverlayState::Running { .. }) {
+                                app.overlay = OverlayState::Done(Overlay {
+                                    title: "Connect".into(),
+                                    lines: buf.to_ratatui_lines(),
+                                    scroll: 0,
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            let mut buf = OutputBuffer::new();
+                            buf.err(&format!("Connection failed: {e}"));
+                            if matches!(app.overlay, OverlayState::Running { .. }) {
+                                app.overlay = OverlayState::Done(Overlay {
+                                    title: "Connect".into(),
+                                    lines: buf.to_ratatui_lines(),
+                                    scroll: 0,
+                                });
+                            }
+                        }
+                    }
+                    app.spawn_stats_refresh();
                 }
-                AppMessage::CountriesFetched { entries } => {
-                    if entries.is_empty() {
+                AppMessage::DisconnectResult { result } => {
+                    let mut buf = OutputBuffer::new();
+                    match result {
+                        Ok(()) => {
+                            buf.ok("Disconnected.");
+                            app.session = None;
+                            app.connect_time = None;
+                        }
+                        Err(e) => {
+                            buf.err(&format!("Disconnect failed: {e}"));
+                        }
+                    }
+                    if matches!(app.overlay, OverlayState::Running { .. }) {
                         app.overlay = OverlayState::Done(Overlay {
-                            title: "Change Server".into(),
-                            lines: vec![Line::from(Span::styled(
-                                "  No countries available",
-                                Style::default().fg(Color::Red),
-                            ))],
+                            title: "Disconnect".into(),
+                            lines: buf.to_ratatui_lines(),
                             scroll: 0,
                         });
-                    } else {
-                        app.cached_countries = Some(entries.clone());
-                        app.overlay = OverlayState::Picker(PickerState::new(
-                            PickerStep::Countries, entries,
-                        ));
                     }
+                    app.spawn_stats_refresh();
                 }
-                AppMessage::CitiesFetched { country_code, country_name, entries } => {
-                    if entries.is_empty() {
-                        // No cities — connect directly to country
-                        app.overlay = OverlayState::Running {
-                            title: format!("Connecting to {country_name}"),
-                            spinner_frame: 0,
-                            started: Instant::now(),
-                        };
-                        let vpn = Arc::clone(&app.vpn);
-                        let config = Arc::clone(&app.config);
-                        let tx = app.msg_tx.clone();
-                        thread::spawn(move || {
-                            let buf = commands::do_connect(&vpn, &config, ConnectMode::Country(country_code));
-                            let _ = tx.send(AppMessage::ActionDone {
-                                title: "Change Server".into(),
-                                buf,
-                            });
-                        });
-                    } else {
-                        app.overlay = OverlayState::Picker(PickerState::new(
-                            PickerStep::Cities { country_code, country_name }, entries,
-                        ));
-                    }
+                AppMessage::StatsRefreshed { ip, net_info } => {
+                    app.apply_stats_refresh(ip, net_info);
                 }
             }
         }
@@ -651,7 +607,6 @@ fn main_loop(
 
 /// Handle key presses when an overlay is visible.
 fn handle_overlay_key(app: &mut App, code: KeyCode) {
-    // Handle picker separately to avoid borrow issues
     if matches!(app.overlay, OverlayState::Picker(_)) {
         handle_picker_key(app, code);
         return;
@@ -711,35 +666,35 @@ fn handle_picker_key(app: &mut App, code: KeyCode) {
                 PickerStep::Countries => {
                     let cc = entry.value.clone();
                     let name = entry.display.clone();
-                    app.overlay = OverlayState::Running {
-                        title: format!("Loading {name}"),
-                        spinner_frame: 0,
-                        started: Instant::now(),
-                    };
-                    let vpn = Arc::clone(&app.vpn);
-                    let tx = app.msg_tx.clone();
-                    thread::spawn(move || {
-                        match vpn.list_cities(&cc) {
-                            Ok(cities) => {
-                                let entries = cities.into_iter()
-                                    .map(|c| PickerEntry { display: c.clone(), value: c })
-                                    .collect();
-                                let _ = tx.send(AppMessage::CitiesFetched {
-                                    country_code: cc,
-                                    country_name: name,
-                                    entries,
-                                });
-                            }
-                            Err(e) => {
-                                let mut buf = OutputBuffer::new();
-                                buf.err(&format!("Failed to load cities: {e}"));
-                                let _ = tx.send(AppMessage::ActionDone {
-                                    title: "Change Server".into(),
-                                    buf,
-                                });
-                            }
+                    // Instantly get cities from local server list
+                    let city_list = servers::cities(&app.servers, &cc);
+                    if city_list.is_empty() {
+                        // No cities — connect directly to country
+                        app.overlay = OverlayState::Running {
+                            title: format!("Connecting to {name}"),
+                            spinner_frame: 0,
+                            started: Instant::now(),
+                        };
+                        let matches = servers::find_by_country(&app.servers, &cc);
+                        if let Some(server) = matches.first() {
+                            let server = (*server).clone();
+                            let backend = Arc::clone(&app.backend);
+                            let tx = app.msg_tx.clone();
+                            thread::spawn(move || {
+                                let result = backend.connect(&server);
+                                let _ = tx.send(AppMessage::ConnectResult { result });
+                            });
                         }
-                    });
+                    } else {
+                        let entries: Vec<PickerEntry> = city_list
+                            .into_iter()
+                            .map(|c| PickerEntry { display: c.clone(), value: c })
+                            .collect();
+                        app.overlay = OverlayState::Picker(PickerState::new(
+                            PickerStep::Cities { country_code: cc, country_name: name },
+                            entries,
+                        ));
+                    }
                 }
                 PickerStep::Cities { .. } => {
                     let city = entry.value.clone();
@@ -748,29 +703,36 @@ fn handle_picker_key(app: &mut App, code: KeyCode) {
                         spinner_frame: 0,
                         started: Instant::now(),
                     };
-                    let vpn = Arc::clone(&app.vpn);
-                    let config = Arc::clone(&app.config);
-                    let tx = app.msg_tx.clone();
-                    thread::spawn(move || {
-                        let buf = commands::do_connect(&vpn, &config, ConnectMode::City(city));
-                        let _ = tx.send(AppMessage::ActionDone {
-                            title: "Change Server".into(),
-                            buf,
+                    let matches = servers::find_by_city(&app.servers, &city);
+                    if let Some(server) = matches.first() {
+                        let server = (*server).clone();
+                        let backend = Arc::clone(&app.backend);
+                        let tx = app.msg_tx.clone();
+                        thread::spawn(move || {
+                            let result = backend.connect(&server);
+                            let _ = tx.send(AppMessage::ConnectResult { result });
                         });
-                    });
+                    }
                 }
             }
         }
         KeyCode::Esc => {
             let go_back_to_countries = matches!(picker.step, PickerStep::Cities { .. });
             if go_back_to_countries {
-                if let Some(cached) = app.cached_countries.clone() {
-                    app.overlay = OverlayState::Picker(PickerState::new(
-                        PickerStep::Countries, cached,
-                    ));
-                } else {
-                    app.overlay = OverlayState::None;
-                }
+                // Rebuild country picker from local data
+                let country_entries: Vec<PickerEntry> = servers::countries(&app.servers)
+                    .into_iter()
+                    .map(|(code, _)| {
+                        let count = servers::find_by_country(&app.servers, &code).len();
+                        PickerEntry {
+                            display: format!("{code}  ({count} server(s))"),
+                            value: code,
+                        }
+                    })
+                    .collect();
+                app.overlay = OverlayState::Picker(PickerState::new(
+                    PickerStep::Countries, country_entries,
+                ));
             } else {
                 app.overlay = OverlayState::None;
             }
@@ -807,10 +769,9 @@ fn handle_dashboard_key(app: &mut App, code: KeyCode) -> anyhow::Result<()> {
 fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
 
-    // Outer border
     let outer = Block::default()
         .borders(Borders::ALL)
-        .title(" pvpn ")
+        .title(" tuinnel ")
         .title_alignment(Alignment::Left)
         .border_style(Style::default().fg(Color::Cyan))
         .title_style(
@@ -821,7 +782,6 @@ fn render(frame: &mut Frame, app: &App) {
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
 
-    // Main vertical split: top panels | bottom panels | footer
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -831,19 +791,16 @@ fn render(frame: &mut Frame, app: &App) {
         ])
         .split(inner);
 
-    // Top: Globe (left) | Connection + Bandwidth (right)
     let top_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(main_chunks[0]);
 
-    // Right panels: Connection (top) | Bandwidth (bottom)
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
         .split(top_chunks[1]);
 
-    // Bottom: Actions (left) | Network (right)
     let bottom_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
@@ -856,7 +813,6 @@ fn render(frame: &mut Frame, app: &App) {
     render_network(frame, app, bottom_chunks[1]);
     render_footer(frame, main_chunks[2]);
 
-    // Draw overlay on top of everything if active
     match &app.overlay {
         OverlayState::None => {}
         OverlayState::Running { title, spinner_frame, started } => {
@@ -877,7 +833,6 @@ fn render_globe(frame: &mut Frame, app: &App, area: Rect) {
 
     let land_coords: Vec<(f64, f64)> = land_points.iter().map(|p| (p.x, p.y)).collect();
 
-    // User location from config (None if not configured — no marker shown)
     let user_coords = app.config.general.user_lat
         .zip(app.config.general.user_lon);
 
@@ -889,7 +844,6 @@ fn render_globe(frame: &mut Frame, app: &App, area: Rect) {
         globe::project_point(lat, lon, app.globe_rotation)
     });
 
-    // Arc from user (or US center fallback) to server
     let arc_origin = user_coords.unwrap_or((geo::FALLBACK_USER_LAT, geo::FALLBACK_USER_LON));
     let arc_points = app.server_coords.map(|(slat, slon)| {
         globe::great_circle_arc(
@@ -921,15 +875,12 @@ fn render_globe(frame: &mut Frame, app: &App, area: Rect) {
 
             let tick = app.globe_rotation as usize;
 
-            // Arc — solid braille line + animated flow dots
             if let Some(ref arc) = arc_points {
                 if arc.len() >= 2 {
-                    // Solid line via braille
                     ctx.draw(&Points {
                         coords: arc,
                         color: Color::Rgb(0, 130, 60),
                     });
-                    // Animated bright dots flowing along it
                     let total = arc.len();
                     let step = (total / 8).max(1);
                     for (i, &(x, y)) in arc.iter().enumerate() {
@@ -943,7 +894,6 @@ fn render_globe(frame: &mut Frame, app: &App, area: Rect) {
                 }
             }
 
-            // User location
             if let Some((ux, uy)) = user_point {
                 let ch = if tick / 6 % 2 == 0 { '◆' } else { '◇' };
                 ctx.print(ux, uy,
@@ -951,7 +901,6 @@ fn render_globe(frame: &mut Frame, app: &App, area: Rect) {
                 );
             }
 
-            // Server location — pulsing
             if let Some((sx, sy)) = server_point {
                 let bright = ((tick as f64 / 4.0).sin() * 60.0 + 195.0) as u8;
                 let ch = if tick / 4 % 2 == 0 { '⊕' } else { '⊙' };
@@ -965,17 +914,8 @@ fn render_globe(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_connection(frame: &mut Frame, app: &App, area: Rect) {
-    let status_color = if app.conn_info.connected {
-        Color::Green
-    } else {
-        Color::Red
-    };
-    let status_text = if app.conn_info.connected {
-        "CONNECTED"
-    } else {
-        "DISCONNECTED"
-    };
-
+    let status_color = if app.conn_info.connected { Color::Green } else { Color::Red };
+    let status_text = if app.conn_info.connected { "CONNECTED" } else { "DISCONNECTED" };
     let uptime = app.uptime_string();
 
     let ks_color = if app.conn_info.kill_switch.starts_with("ON") {
@@ -989,12 +929,7 @@ fn render_connection(frame: &mut Frame, app: &App, area: Rect) {
     let text = vec![
         Line::from(vec![
             Span::styled("  Status:  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                status_text,
-                Style::default()
-                    .fg(status_color)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(status_text, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
         ]),
         Line::from(vec![
             Span::styled("  Server:  ", Style::default().fg(Color::DarkGray)),
@@ -1028,8 +963,7 @@ fn render_connection(frame: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::default().fg(Color::DarkGray))
         .title_style(Style::default().fg(Color::Cyan));
 
-    let paragraph = Paragraph::new(text).block(block);
-    frame.render_widget(paragraph, area);
+    frame.render_widget(Paragraph::new(text).block(block), area);
 }
 
 fn render_bandwidth(frame: &mut Frame, app: &App, area: Rect) {
@@ -1042,16 +976,13 @@ fn render_bandwidth(frame: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if inner.height < 2 {
-        return;
-    }
+    if inner.height < 2 { return; }
 
     let bw_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Length(1)])
         .split(inner);
 
-    // RX sparkline
     let rx_label = format!(" DL {} ", BandwidthMonitor::format_rate(app.bandwidth.rx_rate));
     let rx_sparkline = Sparkline::default()
         .data(&app.bandwidth.rx_history)
@@ -1059,10 +990,7 @@ fn render_bandwidth(frame: &mut Frame, app: &App, area: Rect) {
         .bar_set(ratatui::symbols::bar::NINE_LEVELS);
     let rx_line = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Min(1),
-            Constraint::Length(rx_label.len() as u16),
-        ])
+        .constraints([Constraint::Min(1), Constraint::Length(rx_label.len() as u16)])
         .split(bw_chunks[0]);
     frame.render_widget(rx_sparkline, rx_line[0]);
     frame.render_widget(
@@ -1070,7 +998,6 @@ fn render_bandwidth(frame: &mut Frame, app: &App, area: Rect) {
         rx_line[1],
     );
 
-    // TX sparkline
     if bw_chunks.len() > 1 {
         let tx_label = format!(" UL {} ", BandwidthMonitor::format_rate(app.bandwidth.tx_rate));
         let tx_sparkline = Sparkline::default()
@@ -1079,10 +1006,7 @@ fn render_bandwidth(frame: &mut Frame, app: &App, area: Rect) {
             .bar_set(ratatui::symbols::bar::NINE_LEVELS);
         let tx_line = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Min(1),
-                Constraint::Length(tx_label.len() as u16),
-            ])
+            .constraints([Constraint::Min(1), Constraint::Length(tx_label.len() as u16)])
             .split(bw_chunks[1]);
         frame.render_widget(tx_sparkline, tx_line[0]);
         frame.render_widget(
@@ -1099,14 +1023,10 @@ fn render_actions(frame: &mut Frame, app: &App, area: Rect) {
         .map(|(i, (_, label))| {
             let is_selected = Some(i) == app.list_state.selected();
             let style = if is_selected {
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Blue)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(Color::White).bg(Color::Blue).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
-
             let prefix = if is_selected { " > " } else { "   " };
             ListItem::new(format!("{prefix}{label}")).style(style)
         })
@@ -1124,17 +1044,8 @@ fn render_actions(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_network(frame: &mut Frame, app: &App, area: Rect) {
-    let dns_color = if app.net_info.dns_is_proton {
-        Color::Green
-    } else {
-        Color::Red
-    };
-
-    let leak_color = if app.net_info.leak.contains("None") {
-        Color::Green
-    } else {
-        Color::Yellow
-    };
+    let dns_color = if app.net_info.dns_safe { Color::Green } else { Color::Red };
+    let leak_color = if app.net_info.leak.contains("None") { Color::Green } else { Color::Yellow };
 
     let text = vec![
         Line::from(vec![
@@ -1161,8 +1072,7 @@ fn render_network(frame: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::default().fg(Color::DarkGray))
         .title_style(Style::default().fg(Color::Cyan));
 
-    let paragraph = Paragraph::new(text).block(block);
-    frame.render_widget(paragraph, area);
+    frame.render_widget(Paragraph::new(text).block(block), area);
 }
 
 fn render_footer(frame: &mut Frame, area: Rect) {
@@ -1179,7 +1089,7 @@ fn render_footer(frame: &mut Frame, area: Rect) {
         Span::styled(
             format!(
                 "{:>width$}",
-                format!("pvpn v{version}"),
+                format!("tuinnel v{version}"),
                 width = (area.width as usize).saturating_sub(42)
             ),
             Style::default().fg(Color::DarkGray),
@@ -1205,11 +1115,7 @@ fn render_spinner_overlay(
         .borders(Borders::ALL)
         .title(format!(" {} ", title))
         .border_style(Style::default().fg(Color::Yellow))
-        .title_style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        );
+        .title_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
 
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
@@ -1220,22 +1126,11 @@ fn render_spinner_overlay(
     let text = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled(
-                format!("  {spinner_char} "),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("{title}..."),
-                Style::default().fg(Color::White),
-            ),
+            Span::styled(format!("  {spinner_char} "), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{title}..."), Style::default().fg(Color::White)),
         ]),
         Line::from(""),
-        Line::from(vec![Span::styled(
-            format!("  {elapsed}s elapsed"),
-            Style::default().fg(Color::DarkGray),
-        )]),
+        Line::from(vec![Span::styled(format!("  {elapsed}s elapsed"), Style::default().fg(Color::DarkGray))]),
         Line::from(""),
         Line::from(vec![
             Span::styled("  Esc ", Style::default().fg(Color::Cyan)),
@@ -1254,33 +1149,20 @@ fn render_result_overlay(frame: &mut Frame, overlay: &Overlay, area: Rect) {
         .borders(Borders::ALL)
         .title(format!(" {} ", overlay.title))
         .border_style(Style::default().fg(Color::Cyan))
-        .title_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        );
+        .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
 
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
 
-    // Content with scroll support
     let visible_height = inner.height as usize;
     let total_lines = overlay.lines.len();
     let start = overlay.scroll.min(total_lines.saturating_sub(visible_height));
-
-    // Reserve last line for hint
-    let content_height = if visible_height > 1 {
-        visible_height - 1
-    } else {
-        visible_height
-    };
+    let content_height = if visible_height > 1 { visible_height - 1 } else { visible_height };
     let content_end = (start + content_height).min(total_lines);
 
     let visible_lines: Vec<Line> = overlay.lines[start..content_end].to_vec();
-    let paragraph = Paragraph::new(visible_lines);
-    frame.render_widget(paragraph, inner);
+    frame.render_widget(Paragraph::new(visible_lines), inner);
 
-    // Footer hint at bottom of popup
     if inner.height > 1 {
         let hint_area = Rect {
             x: inner.x,
@@ -1323,7 +1205,6 @@ fn render_picker_overlay(frame: &mut Frame, picker: &PickerState, area: Rect) {
 
     if inner.height < 3 { return; }
 
-    // Search bar at top
     let search_area = Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 };
     let search_display = if picker.query.is_empty() {
         Line::from(vec![
@@ -1339,8 +1220,7 @@ fn render_picker_overlay(frame: &mut Frame, picker: &PickerState, area: Rect) {
     };
     frame.render_widget(Paragraph::new(search_display), search_area);
 
-    // List area (between search bar and footer)
-    let list_height = (inner.height as usize).saturating_sub(2); // search + footer
+    let list_height = (inner.height as usize).saturating_sub(2);
     let total = picker.filtered.len();
 
     let scroll = if picker.selected < picker.scroll_offset {
@@ -1354,10 +1234,7 @@ fn render_picker_overlay(frame: &mut Frame, picker: &PickerState, area: Rect) {
     let end = (scroll + list_height).min(total);
 
     let items: Vec<Line> = if total == 0 {
-        vec![Line::from(Span::styled(
-            "   no matches",
-            Style::default().fg(Color::DarkGray),
-        ))]
+        vec![Line::from(Span::styled("   no matches", Style::default().fg(Color::DarkGray)))]
     } else {
         picker.filtered[scroll..end]
             .iter()
@@ -1388,7 +1265,6 @@ fn render_picker_overlay(frame: &mut Frame, picker: &PickerState, area: Rect) {
     };
     frame.render_widget(Paragraph::new(items), list_area);
 
-    // Footer hints
     let hint_area = Rect {
         x: inner.x,
         y: inner.y + inner.height - 1,
@@ -1412,7 +1288,6 @@ fn render_picker_overlay(frame: &mut Frame, picker: &PickerState, area: Rect) {
     frame.render_widget(Paragraph::new(hints), hint_area);
 }
 
-/// Compute a centered rectangle within `r` at the given percentage size.
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -1436,7 +1311,6 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 // ── Action Handling ─────────────────────────────────────────────────────────
 
 fn handle_selection(app: &mut App) {
-    // Block new actions while one is already running
     if matches!(app.overlay, OverlayState::Running { .. }) {
         return;
     }
@@ -1455,7 +1329,6 @@ fn handle_selection(app: &mut App) {
         _ => {}
     }
 
-    // Show spinner immediately
     let title = match action {
         MenuAction::Reconnect => "Reconnect",
         MenuAction::ChangeServer => "Change Server",
@@ -1466,76 +1339,92 @@ fn handle_selection(app: &mut App) {
         _ => return,
     };
 
+    match action {
+        MenuAction::ChangeServer => {
+            // Instant — built from local server list, no background thread
+            let entries: Vec<PickerEntry> = servers::countries(&app.servers)
+                .into_iter()
+                .map(|(code, _)| {
+                    let count = servers::find_by_country(&app.servers, &code).len();
+                    PickerEntry {
+                        display: format!("{code}  ({count} server(s))"),
+                        value: code,
+                    }
+                })
+                .collect();
+
+            if entries.is_empty() {
+                let mut buf = OutputBuffer::new();
+                buf.warn("No servers found. Drop .conf files into ~/.config/tuinnel/servers/");
+                app.overlay = OverlayState::Done(Overlay {
+                    title: title.into(),
+                    lines: buf.to_ratatui_lines(),
+                    scroll: 0,
+                });
+            } else {
+                app.overlay = OverlayState::Picker(PickerState::new(
+                    PickerStep::Countries, entries,
+                ));
+            }
+            return;
+        }
+        _ => {}
+    }
+
+    // Show spinner for background actions
     app.overlay = OverlayState::Running {
         title: title.to_string(),
         spinner_frame: 0,
         started: Instant::now(),
     };
 
-    // Spawn blocking work in a background thread
-    let vpn = Arc::clone(&app.vpn);
+    let backend = Arc::clone(&app.backend);
     let config = Arc::clone(&app.config);
     let tx = app.msg_tx.clone();
+    let session = app.session.clone();
+    let server_list = app.servers.clone();
 
     match action {
         MenuAction::Reconnect => {
             thread::spawn(move || {
-                let mode = match config.general.default_connect.as_str() {
-                    "random" => ConnectMode::Random,
-                    "preferred" => ConnectMode::Preferred,
-                    _ => ConnectMode::Fastest,
+                let target = match config.general.default_connect.as_str() {
+                    "random" => ConnectTarget::Random,
+                    "preferred" => ConnectTarget::Preferred,
+                    _ => ConnectTarget::First,
                 };
-                let buf = commands::do_connect(&vpn, &config, mode);
-                let _ = tx.send(AppMessage::ActionDone {
-                    title: "Reconnect".into(),
-                    buf,
-                });
-            });
-        }
-        MenuAction::ChangeServer => {
-            thread::spawn(move || {
-                match vpn.list_countries() {
-                    Ok(countries) => {
-                        let entries = countries.into_iter()
-                            .map(|(name, code)| PickerEntry { display: format!("{name}  ({code})"), value: code })
-                            .collect();
-                        let _ = tx.send(AppMessage::CountriesFetched { entries });
-                    }
-                    Err(e) => {
-                        let mut buf = OutputBuffer::new();
-                        buf.err(&format!("Failed to load countries: {e}"));
-                        let _ = tx.send(AppMessage::ActionDone {
-                            title: "Change Server".into(),
-                            buf,
-                        });
-                    }
-                }
+                // Resolve target to a server
+                let manager_tmp = VpnManager::new(backend.clone(), server_list);
+                let server = manager_tmp.resolve_target(&target, &config);
+                let result = match server {
+                    Some(s) => backend.connect(&s),
+                    None => Err("No server found for reconnect".into()),
+                };
+                let _ = tx.send(AppMessage::ConnectResult { result });
             });
         }
         MenuAction::Disconnect => {
             thread::spawn(move || {
-                let buf = commands::do_disconnect(&vpn);
-                let _ = tx.send(AppMessage::ActionDone {
-                    title: "Disconnect".into(),
-                    buf,
-                });
+                let result = match session {
+                    Some(ref s) => backend.disconnect(s),
+                    None => Err("Not connected".into()),
+                };
+                let _ = tx.send(AppMessage::DisconnectResult { result });
             });
         }
         MenuAction::KillSwitch => {
             thread::spawn(move || {
-                let current = vpn.kill_switch("status");
-                let action_str = match current {
-                    Ok(ref s) if s.to_lowercase().contains("on") => "off",
-                    _ => "on",
-                };
-                let title = format!("Kill Switch ({action_str})");
-                let buf = commands::do_ks(&vpn, action_str);
-                let _ = tx.send(AppMessage::ActionDone { title, buf });
+                let mut buf = OutputBuffer::new();
+                buf.header("Kill Switch");
+                buf.warn("Native kill switch not yet implemented (coming soon)");
+                let _ = tx.send(AppMessage::ActionDone {
+                    title: "Kill Switch".into(),
+                    buf,
+                });
             });
         }
         MenuAction::SecurityAudit => {
             thread::spawn(move || {
-                let buf = security::audit_report();
+                let buf = security::audit_report(session.as_ref());
                 let _ = tx.send(AppMessage::ActionDone {
                     title: "Security Audit".into(),
                     buf,
@@ -1544,7 +1433,8 @@ fn handle_selection(app: &mut App) {
         }
         MenuAction::Doctor => {
             thread::spawn(move || {
-                let buf = crate::doctor::run(&vpn, &config);
+                let manager_tmp = VpnManager::new(backend, server_list);
+                let buf = crate::doctor::run(&manager_tmp, &config, session.as_ref());
                 let _ = tx.send(AppMessage::ActionDone {
                     title: "Doctor".into(),
                     buf,
@@ -1552,7 +1442,6 @@ fn handle_selection(app: &mut App) {
             });
         }
         _ => {
-            // Refresh and Quit handled above
             app.overlay = OverlayState::None;
         }
     }

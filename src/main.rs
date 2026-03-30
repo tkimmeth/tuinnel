@@ -1,19 +1,6 @@
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// main.rs — Entry point for pvpn
+// main.rs — Entry point for tuinnel
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-//
-// Module tree:
-//   pvpn (crate root = main.rs)
-//   ├── output     → terminal color helpers
-//   ├── config     → config loading
-//   ├── vpn        → ProtonVPN CLI backend
-//   ├── net        → network utilities
-//   ├── commands   → shared command implementations
-//   ├── doctor     → system diagnostics
-//   ├── globe      → braille globe rendering + world map
-//   ├── geo        → city coordinate lookup
-//   ├── bandwidth  → live bandwidth monitoring
-//   └── tui        → full-screen dashboard TUI
 
 mod backend;
 mod bandwidth;
@@ -29,16 +16,16 @@ mod security;
 mod servers;
 mod tui;
 mod util;
-mod vpn;
 
+use backend::{ConnectTarget, StubBackend, VpnManager};
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
 
-/// ProtonVPN Terminal Bot — control ProtonVPN from the terminal.
+/// tuinnel — universal VPN TUI for WireGuard and OpenVPN.
 ///
 /// Run with no arguments to launch the interactive TUI dashboard.
 #[derive(Parser)]
-#[command(name = "pvpn", version, about, long_about = None)]
+#[command(name = "tuinnel", version, about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -49,60 +36,59 @@ enum Commands {
     /// Show VPN connection status and network info.
     Status,
 
-    /// Connect to ProtonVPN.
+    /// Connect to a VPN server.
     Connect {
-        /// Connect to the fastest available server.
+        /// Connect to the first available server.
         #[arg(short, long, conflicts_with_all = ["random", "country", "city", "server", "preferred"])]
-        fastest: bool,
+        first: bool,
 
         /// Connect to a random server.
-        #[arg(short, long, conflicts_with_all = ["fastest", "country", "city", "server", "preferred"])]
+        #[arg(short, long, conflicts_with_all = ["first", "country", "city", "server", "preferred"])]
         random: bool,
 
         /// Connect by country code (e.g., US, NL, JP).
-        #[arg(long, value_name = "CC", conflicts_with_all = ["fastest", "random", "city", "server", "preferred"])]
+        #[arg(long, value_name = "CC", conflicts_with_all = ["first", "random", "city", "server", "preferred"])]
         country: Option<String>,
 
         /// Connect by city name (e.g., "New York").
-        #[arg(long, conflicts_with_all = ["fastest", "random", "country", "server", "preferred"])]
+        #[arg(long, conflicts_with_all = ["first", "random", "country", "server", "preferred"])]
         city: Option<String>,
 
-        /// Connect to a specific server (e.g., US-NY#1).
-        #[arg(short, long, value_name = "NAME", conflicts_with_all = ["fastest", "random", "country", "city", "preferred"])]
+        /// Connect to a specific server config (by filename without extension).
+        #[arg(short, long, value_name = "NAME", conflicts_with_all = ["first", "random", "country", "city", "preferred"])]
         server: Option<String>,
 
         /// Use preferred settings from config file.
-        #[arg(short, long, conflicts_with_all = ["fastest", "random", "country", "city", "server"])]
+        #[arg(short, long, conflicts_with_all = ["first", "random", "country", "city", "server"])]
         preferred: bool,
     },
 
-    /// Disconnect from ProtonVPN.
+    /// Disconnect from VPN.
     Disconnect,
 
     /// Kill switch management (on | off | status).
     Ks {
-        /// Action to perform.
         #[arg(value_parser = ["on", "off", "status"])]
         action: String,
     },
 
-    /// Show network information (SSID, routes, DNS, tunnel status).
+    /// Show network information.
     Net,
+
+    /// List discovered server configs.
+    Servers,
 
     /// List available countries.
     Countries,
 
     /// List available cities in a country.
     Cities {
-        /// Country code (e.g., US, ES, JP) or full name.
+        /// Country code (e.g., US, NL, JP).
         country: String,
     },
 
-    /// Quick connect by city, country, or server name (fuzzy).
-    ///
-    /// Examples: pvpn go barcelona, pvpn go tokyo, pvpn go US
+    /// Quick connect by city, country, or server name.
     Go {
-        /// City name, country code, or server name.
         #[arg(num_args = 1..)]
         target: Vec<String>,
     },
@@ -110,7 +96,7 @@ enum Commands {
     /// Run system diagnostics and check dependencies.
     Doctor,
 
-    /// Launch the interactive TUI dashboard (same as running pvpn with no args).
+    /// Launch the interactive TUI dashboard.
     Menu,
 }
 
@@ -128,97 +114,128 @@ fn main() -> anyhow::Result<()> {
 
     // Set up file logging
     setup_logging(&config)?;
-    log::info!("pvpn {} starting", env!("CARGO_PKG_VERSION"));
+    log::info!("tuinnel {} starting", env!("CARGO_PKG_VERSION"));
 
-    // Initialize the VPN backend
-    let vpn = Arc::new(vpn::ProtonVPN::new(&config));
+    // Discover servers
+    let servers_path = config::servers_dir(&config);
+    std::fs::create_dir_all(&servers_path)?;
+    let server_list = servers::discover(&servers_path);
+
+    // Initialize backend (StubBackend until WireGuard is implemented)
+    let backend: Arc<dyn backend::VpnBackend> = Arc::new(StubBackend);
+    let mut manager = VpnManager::new(backend, server_list);
 
     match cli.command {
-        // No subcommand → launch TUI dashboard
         None => {
-            tui::run(Arc::clone(&config), Arc::clone(&vpn))?;
+            tui::run(Arc::clone(&config), &mut manager)?;
         }
 
         Some(Commands::Status) => {
-            commands::do_status(&vpn).print_all();
+            commands::do_status(&manager).print_all();
         }
 
         Some(Commands::Connect {
-            fastest,
+            first,
             random,
             country,
             city,
             server,
             preferred,
         }) => {
-            let mode = if random {
-                vpn::ConnectMode::Random
+            let target = if random {
+                ConnectTarget::Random
             } else if let Some(cc) = country {
-                vpn::ConnectMode::Country(cc)
+                ConnectTarget::Country(cc)
             } else if let Some(name) = server {
-                vpn::ConnectMode::Server(name)
+                ConnectTarget::Server(name)
             } else if let Some(city_name) = city {
-                vpn::ConnectMode::City(city_name)
+                ConnectTarget::City(city_name)
             } else if preferred {
-                vpn::ConnectMode::Preferred
-            } else if fastest {
-                vpn::ConnectMode::Fastest
+                ConnectTarget::Preferred
+            } else if first {
+                ConnectTarget::First
             } else {
                 match config.general.default_connect.as_str() {
-                    "random" => vpn::ConnectMode::Random,
-                    "preferred" => vpn::ConnectMode::Preferred,
-                    _ => vpn::ConnectMode::Fastest,
+                    "random" => ConnectTarget::Random,
+                    "preferred" => ConnectTarget::Preferred,
+                    _ => ConnectTarget::First,
                 }
             };
 
-            commands::do_connect(&vpn, &config, mode).print_all();
+            commands::do_connect(&mut manager, &config, target).print_all();
         }
 
         Some(Commands::Disconnect) => {
-            commands::do_disconnect(&vpn).print_all();
+            commands::do_disconnect(&mut manager).print_all();
         }
 
         Some(Commands::Ks { action }) => {
-            commands::do_ks(&vpn, &action).print_all();
+            // TODO: native kill switch in Phase 5
+            let mut buf = output::OutputBuffer::new();
+            buf.header(&format!("Kill Switch ({action})"));
+            buf.warn("Kill switch not yet implemented (coming in Phase 5)");
+            buf.print_all();
         }
 
         Some(Commands::Net) => {
-            commands::do_net().print_all();
+            commands::do_net(manager.session.as_ref()).print_all();
+        }
+
+        Some(Commands::Servers) => {
+            let mut buf = output::OutputBuffer::new();
+            buf.header("Discovered Servers");
+            if manager.servers.is_empty() {
+                buf.warn("No servers found. Drop .conf files into:");
+                buf.plain(&format!("  {}", servers_path.display()));
+            } else {
+                for s in &manager.servers {
+                    let loc = if !s.city.is_empty() {
+                        format!("{} - {}", s.country, s.city)
+                    } else if !s.country.is_empty() {
+                        s.country.clone()
+                    } else {
+                        "unknown".into()
+                    };
+                    buf.kv(&s.name, &format!("{} [{}] ({})", loc, s.protocol, s.provider));
+                }
+                buf.blank();
+                buf.dim(&format!("{} server(s) found", manager.servers.len()));
+            }
+            buf.print_all();
         }
 
         Some(Commands::Countries) => {
-            commands::do_countries(&vpn).print_all();
+            commands::do_countries(&manager).print_all();
         }
 
         Some(Commands::Cities { country }) => {
-            commands::do_cities(&vpn, &country).print_all();
+            commands::do_cities(&manager, &country).print_all();
         }
 
         Some(Commands::Go { target }) => {
             let query = target.join(" ");
-            let mode = if query.len() == 2 && query.chars().all(|c| c.is_ascii_uppercase()) {
-                vpn::ConnectMode::Country(query)
-            } else if query.contains('#') {
-                vpn::ConnectMode::Server(query)
+            let target = if query.len() == 2 && query.chars().all(|c| c.is_ascii_alphabetic()) {
+                ConnectTarget::Country(query.to_uppercase())
+            } else if query.contains('#') || query.contains('.') {
+                ConnectTarget::Server(query)
             } else {
-                vpn::ConnectMode::City(query)
+                ConnectTarget::City(query)
             };
-            commands::do_connect(&vpn, &config, mode).print_all();
+            commands::do_connect(&mut manager, &config, target).print_all();
         }
 
         Some(Commands::Doctor) => {
-            doctor::run(&vpn, &config).print_all();
+            doctor::run(&manager, &config, manager.session.as_ref()).print_all();
         }
 
         Some(Commands::Menu) => {
-            tui::run(Arc::clone(&config), Arc::clone(&vpn))?;
+            tui::run(Arc::clone(&config), &mut manager)?;
         }
     }
 
     Ok(())
 }
 
-/// Configure file-based logging.
 fn setup_logging(config: &config::Config) -> anyhow::Result<()> {
     use simplelog::{ConfigBuilder, LevelFilter, WriteLogger};
     use std::fs::OpenOptions;

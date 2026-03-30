@@ -18,10 +18,12 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct General {
-    /// Override the ProtonVPN binary name (empty = auto-detect).
-    pub cli_binary: String,
-    /// Default connection strategy: fastest, random, preferred.
+    /// Directory containing VPN config files (empty = default).
+    pub servers_dir: String,
+    /// Default connection strategy: first, random, preferred.
     pub default_connect: String,
+    /// Preferred protocol when both exist: wireguard, openvpn.
+    pub preferred_protocol: String,
     /// Automatically enable kill switch when connecting.
     pub kill_switch_on_connect: bool,
     /// Warn if kill switch is off before connecting.
@@ -35,10 +37,12 @@ pub struct General {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Preferred {
-    /// Country code for --preferred connections.
+    /// Specific server config name (without extension).
+    pub server: String,
+    /// Country code for preferred connections.
     pub country: String,
-    /// Specific server names (e.g., ["US-NY#1"]).
-    pub servers: Vec<String>,
+    /// City name for preferred connections.
+    pub city: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -46,8 +50,8 @@ pub struct Preferred {
 pub struct Autoconnect {
     /// Strategy for the autoconnect systemd service.
     pub strategy: String,
-    /// Seconds to wait for NetworkManager connectivity.
-    pub nm_wait_timeout: u32,
+    /// Seconds to wait for network connectivity.
+    pub wait_timeout: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -71,8 +75,9 @@ impl Default for Config {
 impl Default for General {
     fn default() -> Self {
         Self {
-            cli_binary: String::new(),
-            default_connect: "fastest".into(),
+            servers_dir: String::new(),
+            default_connect: "first".into(),
+            preferred_protocol: "wireguard".into(),
             kill_switch_on_connect: false,
             warn_kill_switch: true,
             user_lat: None,
@@ -84,8 +89,9 @@ impl Default for General {
 impl Default for Preferred {
     fn default() -> Self {
         Self {
+            server: String::new(),
             country: "US".into(),
-            servers: Vec::new(),
+            city: String::new(),
         }
     }
 }
@@ -93,8 +99,8 @@ impl Default for Preferred {
 impl Default for Autoconnect {
     fn default() -> Self {
         Self {
-            strategy: "fastest".into(),
-            nm_wait_timeout: 30,
+            strategy: "first".into(),
+            wait_timeout: 30,
         }
     }
 }
@@ -108,7 +114,6 @@ impl Default for Logging {
 }
 
 impl Config {
-    /// Load config from ~/.config/pvpn-bot/config.toml, falling back to defaults.
     pub fn load() -> Result<Self> {
         let path = Self::path();
 
@@ -117,33 +122,37 @@ impl Config {
             return Ok(Self::default());
         }
 
-        // std::fs::read_to_string reads an entire file into a String.
-        // .context() adds a human-readable message if the operation fails.
         let text = std::fs::read_to_string(&path)
             .context(format!("Failed to read config: {}", path.display()))?;
 
-        // toml::from_str parses the TOML text into our Config struct.
-        // Thanks to #[serde(default)], missing fields get default values.
         let config: Config = toml::from_str(&text)
             .context("Failed to parse config TOML")?;
 
         Ok(config)
     }
 
-    /// Return the config file path.
     pub fn path() -> PathBuf {
         config_dir().join("config.toml")
     }
 }
 
-/// ~/.config/pvpn-bot/
+/// ~/.config/tuinnel/
 pub fn config_dir() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("~/.config"))
         .join("tuinnel")
 }
 
-/// ~/.local/state/pvpn-bot/
+/// Resolved servers directory.
+pub fn servers_dir(config: &Config) -> PathBuf {
+    if config.general.servers_dir.is_empty() {
+        config_dir().join("servers")
+    } else {
+        PathBuf::from(&config.general.servers_dir)
+    }
+}
+
+/// ~/.local/state/tuinnel/
 pub fn state_dir() -> PathBuf {
     dirs::state_dir()
         .unwrap_or_else(|| {
@@ -154,7 +163,7 @@ pub fn state_dir() -> PathBuf {
         .join("tuinnel")
 }
 
-/// ~/.local/state/pvpn-bot/pvpn.log
+/// ~/.local/state/tuinnel/tuinnel.log
 pub fn log_file() -> PathBuf {
     state_dir().join("tuinnel.log")
 }

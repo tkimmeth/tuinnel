@@ -107,17 +107,21 @@ pub fn nm_status() -> String {
 }
 
 /// Check if traffic is going through a VPN tunnel interface.
+/// If `expected_iface` is provided, checks for that specific interface.
+/// Otherwise falls back to generic VPN interface patterns.
 /// Returns (is_tunneled, raw_route_output).
-pub fn is_tunneled() -> (bool, String) {
+pub fn is_tunneled(expected_iface: Option<&str>) -> (bool, String) {
     let (ok, out, _) = run_cmd("ip", &["route", "show", "default"]);
     if !ok {
         return (false, "could not read routes".into());
     }
 
     let lower = out.to_lowercase();
-    let tunneled = ["tun", "wg", "proton", "pvpn", "ipv6leak"]
-        .iter()
-        .any(|pat| lower.contains(pat));
+    let tunneled = if let Some(iface) = expected_iface {
+        lower.contains(&iface.to_lowercase())
+    } else {
+        ["tun", "wg"].iter().any(|pat| lower.contains(pat))
+    };
 
     (tunneled, out)
 }

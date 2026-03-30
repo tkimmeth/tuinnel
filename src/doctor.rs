@@ -1,58 +1,53 @@
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// doctor.rs — System diagnostics
+// doctor.rs — System diagnostics for tuinnel
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-use crate::{config, net, output::OutputBuffer, util, vpn};
+use crate::backend::{SessionInfo, VpnManager};
+use crate::{config, net, output::OutputBuffer, util};
 use std::path::Path;
 
-/// Run all diagnostic checks and return structured output.
-pub fn run(vpn: &vpn::ProtonVPN, _config: &config::Config) -> OutputBuffer {
+pub fn run(manager: &VpnManager, config: &config::Config, session: Option<&SessionInfo>) -> OutputBuffer {
     let mut buf = OutputBuffer::new();
-    buf.header("pvpn doctor — System Check");
+    buf.header("tuinnel doctor — System Check");
     buf.blank();
 
     let mut issues: Vec<String> = Vec::new();
 
-    // ── ProtonVPN CLI ───────────────────────────────────────────────────
+    // ── VPN Tools ──────────────────────────────────────────────────────
+    buf.header("VPN Backend Tools");
 
-    if let Some(ref bin) = vpn.binary {
-        buf.ok(&format!("ProtonVPN CLI: {bin}"));
-        let gen_label = match vpn.generation {
-            vpn::CliGeneration::New => "new (official v0.1.x+)",
-            vpn::CliGeneration::Legacy => "legacy (protonvpn-cli)",
-        };
-        buf.indent(&format!("Generation: {gen_label}"));
-        if let Some(ver) = vpn.version() {
-            buf.indent(&format!("Version: {ver}"));
-        }
+    if util::binary_exists("wg-quick") {
+        buf.ok("wg-quick found (WireGuard)");
     } else {
-        buf.err("ProtonVPN CLI not found");
-        issues.push(
-            "Install from AUR:  yay -S protonvpn-cli\n  \
-                    or:  sudo pacman -S protonvpn-cli  (if in repos)"
-                .into(),
-        );
+        buf.err("wg-quick not found");
+        issues.push("sudo pacman -S wireguard-tools".into());
     }
 
-    // ── NetworkManager ──────────────────────────────────────────────────
-
-    if util::binary_exists("nmcli") {
-        buf.ok("nmcli found");
-        let (ok, _, _) = util::run_cmd("systemctl", &["is-active", "NetworkManager"]);
-        if ok {
-            buf.ok("NetworkManager is running");
-        } else {
-            buf.err("NetworkManager is not running");
-            issues.push("sudo systemctl enable --now NetworkManager".into());
-        }
+    if util::binary_exists("wg") {
+        buf.ok("wg found");
     } else {
-        buf.err("nmcli not found");
-        issues.push("sudo pacman -S networkmanager".into());
+        buf.err("wg not found");
+        issues.push("sudo pacman -S wireguard-tools".into());
     }
 
-    // ── Core tools ──────────────────────────────────────────────────────
+    if util::binary_exists("openvpn") {
+        buf.ok("openvpn found");
+    } else {
+        buf.dim("– openvpn not found (optional, for OpenVPN configs)");
+    }
 
-    for (name, pkg) in &[("curl", "curl"), ("ip", "iproute2")] {
+    // ── Firewall ───────────────────────────────────────────────────────
+
+    if util::binary_exists("nft") {
+        buf.ok("nft found (nftables kill switch)");
+    } else {
+        buf.warn("nft not found — kill switch will not work");
+        issues.push("sudo pacman -S nftables".into());
+    }
+
+    // ── Core tools ─────────────────────────────────────────────────────
+
+    for (name, pkg) in &[("curl", "curl"), ("ip", "iproute2"), ("sudo", "sudo")] {
         if util::binary_exists(name) {
             buf.ok(&format!("{name} found"));
         } else {
@@ -61,7 +56,18 @@ pub fn run(vpn: &vpn::ProtonVPN, _config: &config::Config) -> OutputBuffer {
         }
     }
 
-    // ── TUN device ──────────────────────────────────────────────────────
+    // ── Sudo access ────────────────────────────────────────────────────
+
+    let (sudo_ok, _, _) = util::run_cmd("sudo", &["-n", "true"]);
+    if sudo_ok {
+        buf.ok("Passwordless sudo available");
+    } else {
+        buf.dim("– Passwordless sudo not configured (will prompt for password)");
+        buf.dim("  Optional: add to /etc/sudoers.d/tuinnel:");
+        buf.dim("  %wheel ALL=(root) NOPASSWD: /usr/bin/wg-quick, /usr/bin/wg, /usr/bin/nft");
+    }
+
+    // ── TUN device ─────────────────────────────────────────────────────
 
     if Path::new("/dev/net/tun").exists() {
         buf.ok("TUN device available");
@@ -70,61 +76,30 @@ pub fn run(vpn: &vpn::ProtonVPN, _config: &config::Config) -> OutputBuffer {
         issues.push("sudo modprobe tun".into());
     }
 
-    // ── Keyring ─────────────────────────────────────────────────────────
+    // ── Servers directory ──────────────────────────────────────────────
 
-    let keyring_ok = 'keyring: {
-        for daemon in &["gnome-keyring-daemon", "kwalletd5", "kwalletd6"] {
-            if util::binary_exists(daemon) {
-                let (running, _, _) = util::run_cmd("pgrep", &["-x", daemon]);
-                if running {
-                    buf.ok(&format!("Keyring daemon running: {daemon}"));
-                    break 'keyring true;
-                }
-            }
+    let servers_path = config::servers_dir(config);
+    if servers_path.is_dir() {
+        let count = manager.servers.len();
+        if count > 0 {
+            buf.ok(&format!("Servers dir: {} ({count} configs found)", servers_path.display()));
+        } else {
+            buf.warn(&format!("Servers dir exists but empty: {}", servers_path.display()));
+            buf.dim("  Drop .conf (WireGuard) files into this directory");
         }
-
-        if util::binary_exists("secret-tool") {
-            buf.ok("secret-tool available (libsecret)");
-            break 'keyring true;
-        }
-
-        false
-    };
-
-    if !keyring_ok {
-        buf.warn("No keyring daemon detected — ProtonVPN may not store credentials");
-        issues.push(
-            "sudo pacman -S gnome-keyring libsecret\n  \
-             Then ensure gnome-keyring-daemon starts with your session"
-                .into(),
-        );
-    }
-
-    // ── Python (some ProtonVPN CLIs need it) ────────────────────────────
-
-    if util::binary_exists("python3") || util::binary_exists("python") {
-        buf.ok("Python available (some ProtonVPN CLIs require it)");
     } else {
-        buf.warn("Python not found — may be needed by some ProtonVPN CLI versions");
+        buf.err(&format!("Servers dir not found: {}", servers_path.display()));
+        issues.push(format!("mkdir -p {}", servers_path.display()));
     }
 
-    // ── systemd user session ────────────────────────────────────────────
-
-    let (ok, _, _) = util::run_cmd("systemctl", &["--user", "status"]);
-    if ok {
-        buf.ok("systemd user session available");
-    } else {
-        buf.warn("systemd user session may not be available");
-    }
-
-    // ── Config and state paths ──────────────────────────────────────────
+    // ── Config and state paths ─────────────────────────────────────────
 
     let cfg_path = config::Config::path();
     if cfg_path.exists() {
         buf.ok(&format!("Config: {}", cfg_path.display()));
     } else {
         buf.warn(&format!("Config not found: {}", cfg_path.display()));
-        buf.dim("Run install.sh or create manually");
+        buf.dim("  Will use defaults. Create config.toml to customize.");
     }
 
     let state = config::state_dir();
@@ -134,44 +109,26 @@ pub fn run(vpn: &vpn::ProtonVPN, _config: &config::Config) -> OutputBuffer {
         buf.warn(&format!("Log dir missing: {}", state.display()));
     }
 
-    // ── WiFi backend ────────────────────────────────────────────────────
+    // ── systemd user session ───────────────────────────────────────────
+
+    let (ok, _, _) = util::run_cmd("systemctl", &["--user", "status"]);
+    if ok {
+        buf.ok("systemd user session available");
+    } else {
+        buf.warn("systemd user session may not be available");
+    }
+
+    // ── WiFi backend ───────────────────────────────────────────────────
 
     buf.blank();
     buf.header("WiFi Backend");
-    let backend = net::wifi_backend();
-    buf.kv("Current", &backend);
-
-    if !backend.to_lowercase().contains("iwd") {
-        buf.blank();
-        buf.dim("To switch to iwd with NetworkManager:");
-        buf.dim("  1. sudo pacman -S iwd");
-        buf.dim("  2. Create /etc/NetworkManager/conf.d/wifi_backend.conf:");
-        buf.dim("     [device]");
-        buf.dim("     wifi.backend=iwd");
-        buf.dim("  3. sudo systemctl enable --now iwd");
-        buf.dim("  4. sudo systemctl restart NetworkManager");
-    }
-
-    // ── Capabilities ────────────────────────────────────────────────────
-
-    if vpn.binary.is_some() {
-        buf.blank();
-        buf.header("ProtonVPN CLI Capabilities");
-
-        for (name, available) in vpn.caps_summary() {
-            if available {
-                buf.ok(name);
-            } else {
-                buf.dim(&format!("– {name}"));
-            }
-        }
-    }
+    buf.kv("Current", &net::wifi_backend());
 
     // ── Security Checks ────────────────────────────────────────────────
 
     buf.blank();
     buf.header("Security Checks");
-    let audit = crate::security::full_audit();
+    let audit = crate::security::full_audit(session);
     for check in &audit {
         if check.passed {
             buf.ok(&format!("{}: {}", check.name, check.detail));
@@ -190,7 +147,7 @@ pub fn run(vpn: &vpn::ProtonVPN, _config: &config::Config) -> OutputBuffer {
         }
     }
 
-    // ── Summary ─────────────────────────────────────────────────────────
+    // ── Summary ────────────────────────────────────────────────────────
 
     buf.blank();
 

@@ -1,28 +1,36 @@
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// commands.rs — Shared command implementations
+// commands.rs — Shared command implementations (CLI + TUI)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-//
-// These functions are called from both main.rs (CLI) and tui.rs (TUI menu).
 
+use crate::backend::{ConnectTarget, SessionInfo, VpnManager};
 use crate::config::Config;
-use crate::output::OutputBuffer;
-use crate::vpn::{ConnectMode, ProtonVPN};
 use crate::net;
+use crate::output::OutputBuffer;
+use crate::servers;
 
-/// Display full VPN + network status.
-pub fn do_status(vpn: &ProtonVPN) -> OutputBuffer {
+/// Display VPN + network status.
+pub fn do_status(manager: &VpnManager) -> OutputBuffer {
     let mut buf = OutputBuffer::new();
-    buf.header("ProtonVPN Status");
+    buf.header("VPN Status");
 
-    match vpn.status() {
-        Ok(text) => {
-            for line in text.lines() {
-                if !line.trim().is_empty() {
-                    buf.plain(line);
-                }
+    match &manager.session {
+        Some(s) => {
+            buf.ok(&format!("Connected via {}", s.protocol));
+            buf.kv("Server", &s.display_name);
+            buf.kv("Interface", &s.interface);
+            if !s.provider.is_empty() {
+                buf.kv("Provider", &s.provider);
+            }
+            if !s.country.is_empty() {
+                buf.kv("Country", &s.country);
+            }
+            if !s.city.is_empty() {
+                buf.kv("City", &s.city);
             }
         }
-        Err(e) => buf.err(&format!("Could not get VPN status: {e}")),
+        None => {
+            buf.warn("Not connected");
+        }
     }
 
     buf.header("Network");
@@ -30,7 +38,7 @@ pub fn do_status(vpn: &ProtonVPN) -> OutputBuffer {
     let route = net::default_route();
     buf.kv("Default route", &route);
 
-    let (tunneled, _) = net::is_tunneled();
+    let (tunneled, _) = net::is_tunneled(manager.session.as_ref().map(|s| s.interface.as_str()));
     if tunneled {
         buf.ok("Traffic appears tunneled through VPN");
     } else {
@@ -47,51 +55,27 @@ pub fn do_status(vpn: &ProtonVPN) -> OutputBuffer {
     buf
 }
 
-/// Connect to ProtonVPN.
-pub fn do_connect(vpn: &ProtonVPN, config: &Config, mode: ConnectMode) -> OutputBuffer {
+/// Connect to a server.
+pub fn do_connect(manager: &mut VpnManager, config: &Config, target: ConnectTarget) -> OutputBuffer {
     let mut buf = OutputBuffer::new();
 
-    if vpn.binary.is_none() {
-        buf.err("ProtonVPN CLI not found. Run 'pvpn doctor' for help.");
-        return buf;
-    }
-
-    // Kill switch warning
-    if config.general.warn_kill_switch && vpn.caps.kill_switch {
-        if let Ok(ks_out) = vpn.kill_switch("status") {
-            let lo = ks_out.to_lowercase();
-            if lo.contains("off") || lo.contains("disabled") || lo.contains("inactive") {
-                buf.warn("Kill switch is OFF. Your IP may leak if VPN drops.");
-                buf.dim("Enable with: pvpn ks on");
-            }
-        }
-    }
-
-    // Auto-enable kill switch if configured
-    if config.general.kill_switch_on_connect && vpn.caps.kill_switch {
-        buf.dim("Enabling kill switch...");
-        let _ = vpn.kill_switch("on");
-    }
-
-    let label = match &mode {
-        ConnectMode::Fastest => "fastest".to_string(),
-        ConnectMode::Random => "random".to_string(),
-        ConnectMode::Country(cc) => format!("country: {cc}"),
-        ConnectMode::City(city) => format!("city: {city}"),
-        ConnectMode::Server(s) => format!("server: {s}"),
-        ConnectMode::Preferred => format!("preferred ({})", config.preferred.country),
+    let label = match &target {
+        ConnectTarget::First => "first available".to_string(),
+        ConnectTarget::Random => "random".to_string(),
+        ConnectTarget::Country(cc) => format!("country: {cc}"),
+        ConnectTarget::City(city) => format!("city: {city}"),
+        ConnectTarget::Server(s) => format!("server: {s}"),
+        ConnectTarget::Preferred => "preferred".to_string(),
     };
 
     buf.header(&format!("Connecting ({label})"));
 
-    match vpn.connect_full(&mode, config) {
-        Ok(text) => {
+    match manager.connect(&target, config) {
+        Ok(session) => {
             buf.ok("Connected!");
-            for line in text.lines() {
-                if !line.trim().is_empty() {
-                    buf.plain(line);
-                }
-            }
+            buf.kv("Server", &session.display_name);
+            buf.kv("Interface", &session.interface);
+            buf.kv("Protocol", &session.protocol.to_string());
             buf.kv("Public IP", &net::public_ip());
         }
         Err(e) => buf.err(&format!("Connection failed: {e}")),
@@ -100,114 +84,62 @@ pub fn do_connect(vpn: &ProtonVPN, config: &Config, mode: ConnectMode) -> Output
     buf
 }
 
-/// Disconnect from ProtonVPN.
-pub fn do_disconnect(vpn: &ProtonVPN) -> OutputBuffer {
+/// Disconnect from VPN.
+pub fn do_disconnect(manager: &mut VpnManager) -> OutputBuffer {
     let mut buf = OutputBuffer::new();
-
-    if vpn.binary.is_none() {
-        buf.err("ProtonVPN CLI not found. Run 'pvpn doctor' for help.");
-        return buf;
-    }
-
     buf.header("Disconnecting");
 
-    match vpn.disconnect() {
-        Ok(text) => {
-            buf.ok("Disconnected.");
-            for line in text.lines() {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() && trimmed.to_lowercase() != "disconnected" {
-                    buf.plain(line);
-                }
-            }
-        }
+    match manager.disconnect() {
+        Ok(()) => buf.ok("Disconnected."),
         Err(e) => buf.err(&format!("Disconnect failed: {e}")),
     }
 
     buf
 }
 
-/// Manage kill switch.
-pub fn do_ks(vpn: &ProtonVPN, action: &str) -> OutputBuffer {
+/// List available countries from discovered servers.
+pub fn do_countries(manager: &VpnManager) -> OutputBuffer {
     let mut buf = OutputBuffer::new();
-
-    if vpn.binary.is_none() {
-        buf.err("ProtonVPN CLI not found. Run 'pvpn doctor' for help.");
-        return buf;
-    }
-
-    buf.header(&format!("Kill Switch ({action})"));
-
-    match vpn.kill_switch(action) {
-        Ok(msg) => buf.ok(&msg),
-        Err(e) => buf.err(&e),
-    }
-
-    buf
-}
-
-/// List available countries.
-pub fn do_countries(vpn: &ProtonVPN) -> OutputBuffer {
-    let mut buf = OutputBuffer::new();
-
-    if vpn.binary.is_none() {
-        buf.err("ProtonVPN CLI not found. Run 'pvpn doctor' for help.");
-        return buf;
-    }
-
     buf.header("Available Countries");
 
-    match vpn.list_countries() {
-        Ok(countries) => {
-            if countries.is_empty() {
-                buf.warn("No countries returned");
-            } else {
-                for (name, code) in &countries {
-                    buf.kv(code, name);
-                }
-                buf.blank();
-                buf.dim(&format!("{} countries available", countries.len()));
-                buf.dim("Use: pvpn cities <CODE> to see cities");
-            }
+    let list = servers::countries(&manager.servers);
+    if list.is_empty() {
+        buf.warn("No servers found. Drop .conf files into ~/.config/tuinnel/servers/");
+    } else {
+        for (code, _) in &list {
+            let count = servers::find_by_country(&manager.servers, code).len();
+            buf.kv(code, &format!("{count} server(s)"));
         }
-        Err(e) => buf.err(&format!("Could not list countries: {e}")),
+        buf.blank();
+        buf.dim(&format!("{} countries available", list.len()));
+        buf.dim("Use: tuinnel cities <CODE> to see cities");
     }
 
     buf
 }
 
 /// List available cities in a country.
-pub fn do_cities(vpn: &ProtonVPN, country: &str) -> OutputBuffer {
+pub fn do_cities(manager: &VpnManager, country: &str) -> OutputBuffer {
     let mut buf = OutputBuffer::new();
-
-    if vpn.binary.is_none() {
-        buf.err("ProtonVPN CLI not found. Run 'pvpn doctor' for help.");
-        return buf;
-    }
-
     buf.header(&format!("Cities in {}", country.to_uppercase()));
 
-    match vpn.list_cities(country) {
-        Ok(cities) => {
-            if cities.is_empty() {
-                buf.warn("No cities found");
-            } else {
-                for city in &cities {
-                    buf.plain(city);
-                }
-                buf.blank();
-                buf.dim(&format!("{} cities available", cities.len()));
-                buf.dim("Use: pvpn go <city> to connect");
-            }
+    let list = servers::cities(&manager.servers, country);
+    if list.is_empty() {
+        buf.warn("No cities found for this country");
+    } else {
+        for city in &list {
+            buf.plain(city);
         }
-        Err(e) => buf.err(&format!("Could not list cities: {e}")),
+        buf.blank();
+        buf.dim(&format!("{} cities available", list.len()));
+        buf.dim("Use: tuinnel go <city> to connect");
     }
 
     buf
 }
 
 /// Show network information.
-pub fn do_net() -> OutputBuffer {
+pub fn do_net(session: Option<&SessionInfo>) -> OutputBuffer {
     let mut buf = OutputBuffer::new();
     buf.header("Network Information");
 
@@ -219,7 +151,6 @@ pub fn do_net() -> OutputBuffer {
 
     buf.blank();
     buf.kv("WiFi SSID", &net::wifi_ssid());
-    buf.kv("WiFi backend", &net::wifi_backend());
 
     buf.blank();
     buf.kv("Routes", "");
@@ -228,7 +159,7 @@ pub fn do_net() -> OutputBuffer {
     }
 
     buf.blank();
-    let (tunneled, _) = net::is_tunneled();
+    let (tunneled, _) = net::is_tunneled(session.map(|s| s.interface.as_str()));
     if tunneled {
         buf.ok("Traffic appears tunneled through VPN");
     } else {

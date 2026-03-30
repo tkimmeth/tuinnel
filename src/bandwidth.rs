@@ -31,7 +31,7 @@ pub struct BandwidthMonitor {
 
 impl BandwidthMonitor {
     pub fn new() -> Self {
-        let interface = detect_vpn_interface();
+        let interface: Option<String> = None;
         let (rx, tx) = interface
             .as_ref()
             .map(|iface| read_bytes(iface))
@@ -100,6 +100,21 @@ impl BandwidthMonitor {
         }
     }
 
+    /// Set interface from SessionInfo. Call when session changes.
+    pub fn set_interface(&mut self, name: Option<String>) {
+        if name != self.interface {
+            self.interface = name;
+            if let Some(ref iface) = self.interface {
+                let (rx, tx) = read_bytes(iface);
+                self.last_rx = rx;
+                self.last_tx = tx;
+            }
+            self.rx_rate = 0;
+            self.tx_rate = 0;
+            self.last_sample = Instant::now();
+        }
+    }
+
     /// Check if interface is still up; reset if it went away.
     pub fn refresh_interface(&mut self) {
         let new_iface = detect_vpn_interface();
@@ -149,28 +164,16 @@ fn read_sysfs_counter(iface: &str, counter: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Detect the VPN tunnel interface.
-/// Checks for common ProtonVPN interface names.
+/// Detect any active VPN tunnel interface from sysfs.
 fn detect_vpn_interface() -> Option<String> {
-    let candidates = ["proton0", "wg0", "tun0", "pvpnksintrf0"];
-
-    for name in &candidates {
-        let path = format!("/sys/class/net/{name}");
-        if fs::metadata(&path).is_ok() {
-            return Some(name.to_string());
-        }
-    }
-
-    // Check for any interface containing "proton" or "tun" or "wg"
     if let Ok(entries) = fs::read_dir("/sys/class/net") {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             let lower = name.to_lowercase();
-            if lower.contains("proton") || lower.starts_with("tun") || lower.starts_with("wg") {
+            if lower.starts_with("wg") || lower.starts_with("tun") {
                 return Some(name);
             }
         }
     }
-
     None
 }

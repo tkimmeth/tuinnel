@@ -7,8 +7,9 @@
 // reads it. No module should guess interface names or provider
 // conventions from system state.
 
-use crate::servers::ServerEntry;
+use crate::servers::{self, ServerEntry};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 // ── Protocol ───────────────────────────────────────────────────────────────
@@ -75,4 +76,116 @@ pub trait VpnBackend: Send + Sync {
 
     /// Protocol this backend manages.
     fn protocol(&self) -> Protocol;
+}
+
+// ── ConnectTarget ──────────────────────────────────────────────────────────
+
+/// How to select a server for connection.
+#[derive(Debug, Clone)]
+pub enum ConnectTarget {
+    First,
+    Random,
+    Country(String),
+    City(String),
+    Server(String),
+    Preferred,
+}
+
+// ── VpnManager ─────────────────────────────────────────────────────────────
+
+/// Owns the backend, server list, and active session. This is the central
+/// object that commands, TUI, and CLI all interact with.
+pub struct VpnManager {
+    pub backend: Arc<dyn VpnBackend>,
+    pub servers: Vec<ServerEntry>,
+    pub session: Option<SessionInfo>,
+}
+
+impl VpnManager {
+    pub fn new(backend: Arc<dyn VpnBackend>, servers: Vec<ServerEntry>) -> Self {
+        let session = backend.probe_session();
+        Self { backend, servers, session }
+    }
+
+    /// Resolve a ConnectTarget to a specific ServerEntry.
+    pub fn resolve_target(
+        &self,
+        target: &ConnectTarget,
+        config: &crate::config::Config,
+    ) -> Option<ServerEntry> {
+        match target {
+            ConnectTarget::First => {
+                servers::pick_first(&self.servers).cloned()
+            }
+            ConnectTarget::Random => {
+                servers::pick_random(&self.servers).cloned()
+            }
+            ConnectTarget::Country(cc) => {
+                let matches = servers::find_by_country(&self.servers, cc);
+                matches.first().cloned().cloned()
+            }
+            ConnectTarget::City(name) => {
+                let matches = servers::find_by_city(&self.servers, name);
+                matches.first().cloned().cloned()
+            }
+            ConnectTarget::Server(name) => {
+                servers::find_by_name(&self.servers, name).cloned()
+            }
+            ConnectTarget::Preferred => {
+                // Try server name first, then city, then country
+                if !config.preferred.server.is_empty() {
+                    if let Some(s) = servers::find_by_name(&self.servers, &config.preferred.server) {
+                        return Some(s.clone());
+                    }
+                }
+                if !config.preferred.city.is_empty() {
+                    let matches = servers::find_by_city(&self.servers, &config.preferred.city);
+                    if let Some(s) = matches.first() {
+                        return Some((*s).clone());
+                    }
+                }
+                let matches = servers::find_by_country(&self.servers, &config.preferred.country);
+                matches.first().cloned().cloned()
+            }
+        }
+    }
+
+    /// Connect to a server matching the target.
+    pub fn connect(
+        &mut self,
+        target: &ConnectTarget,
+        config: &crate::config::Config,
+    ) -> Result<SessionInfo, String> {
+        let server = self
+            .resolve_target(target, config)
+            .ok_or_else(|| format!("No server found for {:?}", target))?;
+        let session = self.backend.connect(&server)?;
+        self.session = Some(session.clone());
+        Ok(session)
+    }
+
+    /// Disconnect the active session.
+    pub fn disconnect(&mut self) -> Result<(), String> {
+        let session = self.session.take().ok_or("Not connected")?;
+        self.backend.disconnect(&session)
+    }
+}
+
+// ── StubBackend (temporary until WireGuard backend in Phase 4) ─────────────
+
+pub struct StubBackend;
+
+impl VpnBackend for StubBackend {
+    fn connect(&self, _server: &ServerEntry) -> Result<SessionInfo, String> {
+        Err("No VPN backend configured. WireGuard backend coming soon.".into())
+    }
+    fn disconnect(&self, _session: &SessionInfo) -> Result<(), String> {
+        Err("No VPN backend configured.".into())
+    }
+    fn probe_session(&self) -> Option<SessionInfo> {
+        None
+    }
+    fn protocol(&self) -> Protocol {
+        Protocol::WireGuard
+    }
 }
