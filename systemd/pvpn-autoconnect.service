@@ -1,0 +1,18 @@
+[Unit]
+Description=ProtonVPN autoconnect (pvpn-bot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+# Wait for NetworkManager to report full connectivity before connecting.
+ExecStartPre=/usr/bin/nm-online -q --timeout=30
+
+# Connect using your configured strategy (edit ~/.config/pvpn-bot/config.toml).
+ExecStart=%h/.local/bin/pvpn connect --preferred
+
+RemainAfterExit=yes
+
+[Install]
+WantedBy=default.target

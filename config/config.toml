@@ -1,0 +1,42 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# pvpn-bot configuration
+# ──────────────────────────────────────────────────────────────────────────────
+# Location: ~/.config/pvpn-bot/config.toml
+
+[general]
+# Override the ProtonVPN CLI binary (leave empty for auto-detect).
+# Auto-detect tries: protonvpn-cli, protonvpn
+cli_binary = ""
+
+# Default connection strategy when no flag is given: fastest, random, preferred
+default_connect = "fastest"
+
+# Automatically enable kill switch when connecting.
+kill_switch_on_connect = false
+
+# Warn if kill switch is off before connecting.
+warn_kill_switch = true
+
+# Your location for the TUI globe marker (optional).
+# Set to show an "X marks the spot" marker on the spinning globe.
+# Omit to hide the marker — don't commit your real coords to git.
+# user_lat = 40.71
+# user_lon = -74.01
+
+[preferred]
+# Country code used by `pvpn connect --preferred`
+country = "US"
+
+# Specific server names (if your CLI supports them).
+# servers = ["US-NY#1", "US-CA#5"]
+
+[autoconnect]
+# Strategy for the systemd autoconnect service: fastest, random, preferred
+strategy = "fastest"
+
+# Seconds to wait for NetworkManager connectivity before connecting.
+nm_wait_timeout = 30
+
+[logging]
+# Log level: DEBUG, INFO, WARN, ERROR
+level = "INFO"
