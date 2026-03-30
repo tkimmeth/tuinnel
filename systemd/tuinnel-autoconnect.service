@@ -1,0 +1,13 @@
+[Unit]
+Description=tuinnel VPN autoconnect
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStartPre=/usr/bin/nm-online -q --timeout=30
+ExecStart=%h/.local/bin/tuinnel connect --preferred
+RemainAfterExit=yes
+
+[Install]
+WantedBy=default.target

@@ -171,21 +171,3 @@ impl VpnManager {
     }
 }
 
-// ── StubBackend (temporary until WireGuard backend in Phase 4) ─────────────
-
-pub struct StubBackend;
-
-impl VpnBackend for StubBackend {
-    fn connect(&self, _server: &ServerEntry) -> Result<SessionInfo, String> {
-        Err("No VPN backend configured. WireGuard backend coming soon.".into())
-    }
-    fn disconnect(&self, _session: &SessionInfo) -> Result<(), String> {
-        Err("No VPN backend configured.".into())
-    }
-    fn probe_session(&self) -> Option<SessionInfo> {
-        None
-    }
-    fn protocol(&self) -> Protocol {
-        Protocol::WireGuard
-    }
-}
