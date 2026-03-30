@@ -15,6 +15,7 @@
 //   ├── bandwidth  → live bandwidth monitoring
 //   └── tui        → full-screen dashboard TUI
 
+mod backend;
 mod bandwidth;
 mod commands;
 mod config;
@@ -25,6 +26,7 @@ mod net;
 mod output;
 mod privilege;
 mod security;
+mod servers;
 mod tui;
 mod util;
 mod vpn;
