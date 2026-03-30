@@ -16,8 +16,10 @@ mod security;
 mod servers;
 mod tui;
 mod util;
+mod wireguard;
 
-use backend::{ConnectTarget, StubBackend, VpnManager};
+use backend::{ConnectTarget, VpnManager};
+use wireguard::WireGuardBackend;
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
 
@@ -121,8 +123,8 @@ fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&servers_path)?;
     let server_list = servers::discover(&servers_path);
 
-    // Initialize backend (StubBackend until WireGuard is implemented)
-    let backend: Arc<dyn backend::VpnBackend> = Arc::new(StubBackend);
+    // Initialize WireGuard backend
+    let backend: Arc<dyn backend::VpnBackend> = Arc::new(WireGuardBackend);
     let mut manager = VpnManager::new(backend, server_list);
 
     match cli.command {
