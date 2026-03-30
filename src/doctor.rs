@@ -151,14 +151,21 @@ pub fn run(manager: &VpnManager, config: &config::Config, session: Option<&Sessi
 
     buf.blank();
 
-    if issues.is_empty() {
+    let security_failures = audit.iter().any(|c| !c.passed);
+
+    if issues.is_empty() && !security_failures {
         buf.ok("All checks passed!");
     } else {
-        buf.header("Fixes Needed");
-        for fix in &issues {
-            for line in fix.lines() {
-                buf.plain(&format!("\x1b[33m$\x1b[0m {line}"));
+        if !issues.is_empty() {
+            buf.header("Fixes Needed");
+            for fix in &issues {
+                for line in fix.lines() {
+                    buf.plain(&format!("\x1b[33m$\x1b[0m {line}"));
+                }
             }
+        }
+        if security_failures {
+            buf.warn("Some security checks failed — review above");
         }
     }
 

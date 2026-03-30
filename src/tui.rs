@@ -318,11 +318,7 @@ impl App {
                 let server = s.display_name.clone();
                 let city = if s.city.is_empty() { "--".into() } else { s.city.clone() };
                 let protocol = s.protocol.to_string();
-                let kill_switch = if security::check_kill_switch_firewall().passed {
-                    "ON (firewall rules active)".into()
-                } else {
-                    "OFF".into()
-                };
+                let kill_switch = crate::killswitch::status_string();
 
                 ConnectionInfo {
                     connected: true,
@@ -1415,7 +1411,21 @@ fn handle_selection(app: &mut App) {
             thread::spawn(move || {
                 let mut buf = OutputBuffer::new();
                 buf.header("Kill Switch");
-                buf.warn("Native kill switch not yet implemented (coming soon)");
+                let currently_on = crate::killswitch::is_active();
+                if currently_on {
+                    match crate::killswitch::disable() {
+                        Ok(msg) => buf.ok(&msg),
+                        Err(e) => buf.err(&e),
+                    }
+                } else {
+                    match &session {
+                        Some(s) => match crate::killswitch::enable(s) {
+                            Ok(msg) => buf.ok(&msg),
+                            Err(e) => buf.err(&e),
+                        },
+                        None => buf.err("Not connected — connect first, then enable kill switch"),
+                    }
+                }
                 let _ = tx.send(AppMessage::ActionDone {
                     title: "Kill Switch".into(),
                     buf,

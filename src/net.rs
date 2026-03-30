@@ -107,21 +107,38 @@ pub fn nm_status() -> String {
 }
 
 /// Check if traffic is going through a VPN tunnel interface.
-/// If `expected_iface` is provided, checks for that specific interface.
-/// Otherwise falls back to generic VPN interface patterns.
+/// WireGuard uses 0.0.0.0/1 + 128.0.0.0/1 routes instead of replacing
+/// the default route, so we check all routes, not just `default`.
 /// Returns (is_tunneled, raw_route_output).
 pub fn is_tunneled(expected_iface: Option<&str>) -> (bool, String) {
-    let (ok, out, _) = run_cmd("ip", &["route", "show", "default"]);
-    if !ok {
-        return (false, "could not read routes".into());
-    }
-
-    let lower = out.to_lowercase();
-    let tunneled = if let Some(iface) = expected_iface {
-        lower.contains(&iface.to_lowercase())
+    // Check main routing table
+    let (ok, main_routes, _) = run_cmd("ip", &["route"]);
+    let main_display = if ok {
+        main_routes
+            .lines()
+            .find(|l| l.starts_with("default"))
+            .unwrap_or("--")
+            .to_string()
     } else {
-        ["tun", "wg"].iter().any(|pat| lower.contains(pat))
+        "could not read routes".to_string()
     };
 
-    (tunneled, out)
+    // Also check all routing tables — WireGuard uses fwmark-based
+    // policy routing with routes in a separate table (e.g. table 51820)
+    let (_, all_routes, _) = run_cmd("ip", &["route", "show", "table", "all"]);
+    let combined = format!("{}\n{}", main_routes, all_routes).to_lowercase();
+
+    let tunneled = if let Some(iface) = expected_iface {
+        let iface_lower = iface.to_lowercase();
+        combined.lines().any(|l| l.contains(&iface_lower))
+    } else {
+        combined.lines().any(|l| {
+            (l.contains(" tun") || l.contains(" wg"))
+                && (l.starts_with("0.0.0.0/1")
+                    || l.starts_with("128.0.0.0/1")
+                    || l.starts_with("default"))
+        })
+    };
+
+    (tunneled, main_display)
 }

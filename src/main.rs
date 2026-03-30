@@ -14,6 +14,7 @@ mod output;
 mod privilege;
 mod security;
 mod servers;
+mod killswitch;
 mod tui;
 mod util;
 mod wireguard;
@@ -172,10 +173,25 @@ fn main() -> anyhow::Result<()> {
         }
 
         Some(Commands::Ks { action }) => {
-            // TODO: native kill switch in Phase 5
             let mut buf = output::OutputBuffer::new();
             buf.header(&format!("Kill Switch ({action})"));
-            buf.warn("Kill switch not yet implemented (coming in Phase 5)");
+            match action.as_str() {
+                "on" => {
+                    match &manager.session {
+                        Some(session) => match killswitch::enable(session) {
+                            Ok(msg) => buf.ok(&msg),
+                            Err(e) => buf.err(&e),
+                        },
+                        None => buf.err("Not connected — connect first, then enable kill switch"),
+                    }
+                }
+                "off" => match killswitch::disable() {
+                    Ok(msg) => buf.ok(&msg),
+                    Err(e) => buf.err(&e),
+                },
+                "status" => buf.ok(&killswitch::status_string()),
+                _ => buf.err(&format!("Unknown action: {action}")),
+            }
             buf.print_all();
         }
 
