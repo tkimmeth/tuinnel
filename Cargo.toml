@@ -4,7 +4,7 @@ version = "1.0.0"
 edition = "2021"
 description = "Universal VPN TUI for WireGuard and OpenVPN"
 license = "MIT"
-repository = "https://github.com/tommyothen/tuinnel"
+repository = "https://github.com/tkimmeth/tuinnel"
 
 [[bin]]
 name = "tuinnel"

@@ -24,7 +24,7 @@ sudo apt install wireguard-tools openresolv nftables curl
 ## Install
 
 ```
-git clone https://github.com/tommyothen/tuinnel
+git clone https://github.com/tkimmeth/tuinnel
 cd tuinnel
 ./install.sh
 ```
