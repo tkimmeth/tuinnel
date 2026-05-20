@@ -37,9 +37,16 @@ cp target/release/tuinnel ~/.local/bin/
 
 ## Setup
 
-1. Download WireGuard `.conf` files from your VPN provider's website.
+1. Download WireGuard `.conf` files (or a zip of them) from your VPN provider's website.
 
-2. Drop them into `~/.config/tuinnel/servers/`:
+2. Either let `tuinnel import` place them for you:
+```
+tuinnel import ~/Downloads/wireguard-configs.zip
+tuinnel import ~/Downloads/us-nyc-001.conf --provider mullvad --country US --city "New York"
+tuinnel import ~/configs/             # walk a directory recursively
+tuinnel import https://example.com/configs.zip   # https only, 10 MB cap
+```
+…or drop them into `~/.config/tuinnel/servers/` by hand:
 ```
 ~/.config/tuinnel/servers/
   mullvad/US/NewYork/us-nyc-001.conf
@@ -49,6 +56,11 @@ cp target/release/tuinnel ~/.local/bin/
 
 Directory structure is optional but gives you country/city metadata:
 `servers/<provider>/<country>/<city>/file.conf`
+
+`tuinnel import` rejects any config containing `PostUp`, `PostDown`, `PreUp`,
+`PreDown`, `Table`, `FwMark`, or `SaveConfig` — these are the directives
+`wg-quick` interprets as shell commands run as root. Use `--dry-run` to
+preview the destination paths before writing.
 
 3. Run `tuinnel doctor` to verify everything is set up.
 
@@ -68,6 +80,7 @@ tuinnel servers                  # List discovered configs
 tuinnel countries                # List available countries
 tuinnel cities US                # List cities in a country
 tuinnel go tokyo                 # Quick connect (fuzzy match)
+tuinnel import <path|zip|url>    # Import .conf / .ovpn configs
 tuinnel doctor                   # System diagnostics
 ```
 
@@ -107,9 +120,22 @@ lon = -74.01
 systemctl --user enable --now tuinnel-autoconnect.service
 ```
 
-## Passwordless sudo (optional)
+## Security model — read before granting `NOPASSWD`
 
-`wg-quick` needs root. To avoid password prompts:
+`wg-quick` needs root because it brings up network interfaces, sets routes, and edits `/etc/resolv.conf`. The convenient way to skip password prompts is a `NOPASSWD` sudoers entry, but **`wg-quick` is a bash script that interprets `PostUp`, `PostDown`, `PreUp`, and `PreDown` lines as shell commands run as root**. Granting `NOPASSWD: /usr/bin/wg-quick` is therefore equivalent to granting `NOPASSWD: bash` to anything that can write a `.conf` file into `~/.config/tuinnel/servers/`. The same caveat applies to `NOPASSWD: /usr/bin/nft` — it permits `nft flush ruleset` (whole-host firewall wipe) and arbitrary ruleset loads.
+
+**Threat model summary:**
+
+- Configs in `~/.config/tuinnel/servers/` are a **privilege boundary**, not user data. Treat them like `/etc/sudoers.d/`.
+- Only drop `.conf` files you obtained directly from your VPN provider's official portal.
+- Inspect new `.conf` files for `PostUp`/`PostDown`/`PreUp`/`PreDown` directives before connecting. Legitimate provider configs do not need them.
+- Keep your kernel current — CVE-2024-1086 (`nf_tables` UAF) is actively exploited and patched in Linux 5.15.149+ / 6.1.76+ / 6.6.15+ / 6.8+.
+
+A safer alternative — a root-owned helper script that validates configs and confines `nft` to a fixed ruleset — is on the roadmap. See `docs/adr/004-privilege-model.md`.
+
+### Passwordless sudo (optional, with caveats)
+
+If you accept the trade-off above:
 
 ```
 sudo tee /etc/sudoers.d/tuinnel <<< '%wheel ALL=(root) NOPASSWD: /usr/bin/wg-quick, /usr/bin/wg, /usr/bin/nft'

@@ -9,6 +9,7 @@ mod config;
 mod doctor;
 mod geo;
 mod globe;
+mod import;
 mod net;
 mod output;
 mod privilege;
@@ -22,6 +23,7 @@ mod wireguard;
 use backend::{ConnectTarget, VpnManager};
 use wireguard::WireGuardBackend;
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// tuinnel — universal VPN TUI for WireGuard and OpenVPN.
@@ -96,6 +98,32 @@ enum Commands {
         target: Vec<String>,
     },
 
+    /// Import .conf / .ovpn configs from a file, directory, .zip, or https:// URL.
+    Import {
+        /// Source path or https:// URL.
+        source: PathBuf,
+
+        /// Overwrite existing configs with the same stem.
+        #[arg(long)]
+        force: bool,
+
+        /// Preview without writing anything to disk.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Provider name override (skips inference).
+        #[arg(long)]
+        provider: Option<String>,
+
+        /// Country code override (2-letter, will be uppercased).
+        #[arg(long)]
+        country: Option<String>,
+
+        /// City override.
+        #[arg(long)]
+        city: Option<String>,
+    },
+
     /// Run system diagnostics and check dependencies.
     Doctor,
 
@@ -111,6 +139,17 @@ fn main() -> anyhow::Result<()> {
     let state_dir = config::state_dir();
     std::fs::create_dir_all(&config_dir)?;
     std::fs::create_dir_all(&state_dir)?;
+
+    // Tighten state dir to 0700; it holds session.toml (with config path
+    // pointers) and the log file. Other-readable is unnecessary.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700));
+    }
+    // If we were launched via sudo, hand the state and config dirs back to the
+    // invoking user so later user-mode runs can still read them.
+    config::chown_to_invoking_user(&state_dir);
+    config::chown_to_invoking_user(&config_dir);
 
     // Load config
     let config = Arc::new(config::Config::load()?);
@@ -242,6 +281,18 @@ fn main() -> anyhow::Result<()> {
             commands::do_connect(&mut manager, &config, target).print_all();
         }
 
+        Some(Commands::Import { source, force, dry_run, provider, country, city }) => {
+            let args = import::ImportArgs {
+                source,
+                force,
+                dry_run,
+                provider,
+                country,
+                city,
+            };
+            import::run(args, &config).print_all();
+        }
+
         Some(Commands::Doctor) => {
             doctor::run(&manager, &config, manager.session.as_ref()).print_all();
         }
@@ -257,6 +308,7 @@ fn main() -> anyhow::Result<()> {
 fn setup_logging(config: &config::Config) -> anyhow::Result<()> {
     use simplelog::{ConfigBuilder, LevelFilter, WriteLogger};
     use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt;
 
     let level = match config.logging.level.to_uppercase().as_str() {
         "DEBUG" => LevelFilter::Debug,
@@ -267,10 +319,20 @@ fn setup_logging(config: &config::Config) -> anyhow::Result<()> {
     };
 
     let log_path = config::log_file();
+    // 0600: log lines may include endpoint hostnames, interface names, and
+    // (in DEBUG) full command arguments. Not secrets, but not for `getent`.
+    // mode() applies on create; set_permissions enforces it on existing files
+    // left over from older versions of tuinnel that wrote with default umask.
     let file = OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(&log_path)?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&log_path, std::fs::Permissions::from_mode(0o600));
+    }
+    config::chown_to_invoking_user(&log_path);
 
     let log_config = ConfigBuilder::new()
         .set_time_format_rfc3339()

@@ -4,8 +4,9 @@
 
 use crate::backend::{ConnectTarget, SessionInfo, VpnManager};
 use crate::config::Config;
+use crate::killswitch;
 use crate::net;
-use crate::output::OutputBuffer;
+use crate::output::{LineKind, OutputBuffer};
 use crate::servers;
 
 /// Display VPN + network status.
@@ -77,6 +78,25 @@ pub fn do_connect(manager: &mut VpnManager, config: &Config, target: ConnectTarg
             buf.kv("Interface", &session.interface);
             buf.kv("Protocol", &session.protocol.to_string());
             buf.kv("Public IP", &net::public_ip());
+
+            // Honor the kill_switch_on_connect config flag. The user has
+            // documented they want kill switch armed for every session;
+            // up to here the flag was dead config.
+            if config.general.kill_switch_on_connect {
+                match killswitch::enable(&session) {
+                    Ok(msg) => buf.ok(&msg),
+                    Err(e) => buf.err(&format!("Kill switch enable failed: {e}")),
+                }
+            } else if config.general.warn_kill_switch && !killswitch::is_active() {
+                // Surface the leak window before they notice the wrong way.
+                // Prepend so the warning sits above "Connected!" in output.
+                buf.lines.insert(
+                    0,
+                    LineKind::Warn(
+                        "Kill switch is OFF — traffic will leak if the tunnel drops".into(),
+                    ),
+                );
+            }
         }
         Err(e) => buf.err(&format!("Connection failed: {e}")),
     }

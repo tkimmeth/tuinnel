@@ -12,7 +12,7 @@
 // State is the table's existence — no sidecar files needed.
 
 use crate::backend::SessionInfo;
-use crate::privilege::run_privileged;
+use crate::privilege::{run_privileged, run_privileged_stdin};
 use crate::util::run_cmd;
 
 /// Enable the kill switch for the given session.
@@ -55,17 +55,11 @@ pub fn enable(session: &SessionInfo) -> Result<String, String> {
     // Remove existing table first (ignore errors if it doesn't exist)
     let _ = run_privileged("nft", &["delete", "table", "inet", "tuinnel_killswitch"]);
 
-    // Install the new ruleset
-    let (ok, stdout, stderr) = run_privileged("nft", &["-f", "-"]);
-    // nft -f - reads from stdin, but we can't pipe. Use a temp approach:
-    // Write ruleset to a temp file, then load it.
-    let tmp_path = "/tmp/tuinnel-killswitch.nft";
-    if std::fs::write(tmp_path, &ruleset).is_err() {
-        return Err("Failed to write temporary nftables rules".into());
-    }
-
-    let (ok, stdout, stderr) = run_privileged("nft", &["-f", tmp_path]);
-    let _ = std::fs::remove_file(tmp_path);
+    // Install the new ruleset by piping through nft's stdin. Avoiding a
+    // predictable temp file (`/tmp/tuinnel-killswitch.nft`) closes the
+    // TOCTOU window where another local user could swap the file between
+    // write and `nft -f`.
+    let (ok, stdout, stderr) = run_privileged_stdin("nft", &["-f", "-"], &ruleset);
 
     if !ok {
         let err = if !stderr.is_empty() { stderr } else { stdout };

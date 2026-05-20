@@ -1,9 +1,21 @@
 # tuinnel TODO
 
-## Next up
+## Security hardening (priority — see `CLAUDE.md` and `docs/adr/004-privilege-model.md`)
+
+- **[Critical] Replace `NOPASSWD: wg-quick, nft` with a root-owned helper.**
+  - Ship `/usr/local/libexec/tuinnel-helper` with an enum of actions (`up`, `down`, `ks-up`, `ks-down`).
+  - Helper rejects any `.conf` containing `PostUp`/`PostDown`/`PreUp`/`PreDown`/`Table`/`FwMark`/`SaveConfig`.
+  - Helper canonicalizes the path and refuses anything outside the configured `servers_dir`.
+  - Sudoers becomes `%wheel ALL=(root) NOPASSWD: /usr/local/libexec/tuinnel-helper`.
+  - Or — preferred — switch to polkit (`pkexec`) so invocations are logged.
+- **[High] Prevent IPv6 leaks at connect time** when `AllowedIPs` lacks `::/0` and the host has global IPv6. (Detection-only today in `security.rs`.)
+- **[Medium] Use absolute paths for `sudo`/`wg`/`ip`/`nft`/`curl`/`which`** in `util.rs` to close `$PATH` hijack.
+- **[Medium] Manager-level `Mutex`** to remove the probe/disconnect race.
+- **[Low] DNS verification post-connect:** poll `resolvectl dns` until expected; `resolvectl flush-caches`.
+
+## Product
 
 - OpenVPN backend (`openvpn --config --daemon`, PID tracking, auth)
-- `tuinnel import <path>` — guided config import with metadata prompts
 - Populate `probe_session` with server metadata (match interface name to ServerEntry)
 - AUR package (PKGBUILD)
 
